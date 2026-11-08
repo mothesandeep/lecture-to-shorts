@@ -235,6 +235,7 @@ class WordCaption:
     start: float
     end: float
     raw_token: str
+    emphasis: bool = False
 
 
 class HinglishTranscriber:

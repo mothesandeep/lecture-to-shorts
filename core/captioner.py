@@ -25,7 +25,9 @@ Key Invariants:
 from __future__ import annotations
 
 import copy
+import math
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +43,162 @@ try:
 except ImportError:
     from transcriber import DEV, WordCaption
     from av_sync import ensure_cfr_video, probe_av_sync, verify_av_sync
+
+
+# ── Kinetic Animation Math & Helpers ──────────────────────────────────────────────────
+
+def ease_out_back(t: float, s: float = 2.70) -> float:
+    """
+    Ease-Out Back curve with controlled overshoot.
+    t in [0.0, 1.0]. Returns 0.0 at t=0, overshoots to ~1.20 at t~0.5, settles to 1.0 at t=1.
+    """
+    t = max(0.0, min(1.0, t))
+    t = t - 1.0
+    return float(1.0 + (s + 1.0) * (t ** 3) + s * (t ** 2))
+
+
+def spring_eval(t: float, frequency: float = 14.0, damping: float = 0.7) -> float:
+    """
+    Second-order underdamped spring response helper.
+    t in [0.0, 1.0]. Oscillates with natural frequency and damping ratio, settling to 1.0.
+    """
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+    omega = frequency
+    zeta = max(0.01, min(0.99, damping))
+    omega_d = omega * math.sqrt(1.0 - zeta * zeta)
+    decay = math.exp(-zeta * omega * t)
+    return float(1.0 - decay * (math.cos(omega_d * t) + (zeta * omega / omega_d) * math.sin(omega_d * t)))
+
+
+def smoothstep(edge0: float, edge1: float, x: float) -> float:
+    """Hermite interpolation with zero first derivatives at boundaries."""
+    if edge1 == edge0:
+        return 0.0
+    t = max(0.0, min(1.0, (x - edge0) / (edge1 - edge0)))
+    return float(t * t * (3.0 - 2.0 * t))
+
+
+def entrance_scale_profile(frame_idx: int, total_frames: int = 7) -> float:
+    """
+    Per-word entrance animation: scale 0.6 -> 1.08 -> 1.0 over total_frames (6-8 frames).
+    Frame 0: 0.60, Frame 3-4: 1.08 (peak overshoot), Frame 6-7: 1.00 (settles).
+    """
+    if total_frames <= 1 or frame_idx <= 0:
+        return 0.60
+    if frame_idx >= total_frames - 1:
+        return 1.00
+    u = frame_idx / float(total_frames - 1)
+    val = ease_out_back(u, s=2.70)
+    return float(0.60 + 0.40 * val)
+
+
+def active_pop_profile(frame_idx: int, total_frames: int = 6) -> Tuple[float, int]:
+    """
+    Active word pop animation: scale 1.0 -> 1.15 -> 1.05 and short y-slide over total_frames.
+    Returns (scale_mult, y_shift_px).
+    """
+    if frame_idx <= 0:
+        return (1.00, 0)
+    if frame_idx >= total_frames - 1:
+        return (1.05, -2)
+    scales = [1.00, 1.08, 1.15, 1.11, 1.07, 1.05]
+    y_shifts = [0, -2, -4, -3, -2, -2]
+    idx = min(frame_idx, len(scales) - 1)
+    return (scales[idx], y_shifts[idx])
+
+
+TERMINAL_PUNCT_CHARS = {".", "?", "!", "|", "।", ";", "॥"}
+
+
+def has_terminal_punct(s: str) -> bool:
+    """Return True if string contains or ends with terminal punctuation."""
+    if not s:
+        return False
+    s_strip = s.strip()
+    return bool(s_strip and s_strip[-1] in TERMINAL_PUNCT_CHARS)
+
+
+def is_emphasis_word(w: WordCaption) -> bool:
+    """
+    Determine if a word should receive an emphasis bump.
+    Checks:
+    1. Explicit flag w.emphasis == True (from words/Gemini)
+    2. Terminal '!' in raw_token or word
+    3. All-caps word with length >= 3 (e.g. 'PW', 'JEE', 'IMPORTANT')
+    4. Elongated duration >= 0.55s
+    """
+    if getattr(w, "emphasis", False):
+        return True
+    raw = getattr(w, "raw_token", "") or ""
+    txt = getattr(w, "word", "") or ""
+    if raw.endswith("!") or txt.endswith("!"):
+        return True
+    clean = re.sub(r"[^A-Za-z0-9]", "", txt)
+    if len(clean) >= 3 and clean.isupper():
+        return True
+    if (getattr(w, "end", 0.0) - getattr(w, "start", 0.0)) >= 0.55:
+        return True
+    return False
+
+
+def blend_sprite_to_frame(
+    frame: np.ndarray,
+    sprite: CaptionSprite,
+    y_override: Optional[int] = None,
+    base_y_pos: Optional[int] = None,
+    alpha_mult: float = 1.0,
+) -> None:
+    """
+    Blend precomputed sprite ROI into frame using in-place NumPy premultiplied alpha math.
+    Supports vertical position override (for rolling layout) and alpha attenuation (for fades).
+    """
+    if sprite.sprite_pre is None or sprite.inv_alpha is None:
+        return
+
+    H, W = sprite.sprite_pre.shape[:2]
+    fH, fW = frame.shape[:2]
+
+    x0 = sprite.roi_x0
+    if y_override is not None and base_y_pos is not None:
+        shift_y = y_override - base_y_pos
+        y0 = sprite.roi_y0 + shift_y
+    else:
+        y0 = sprite.roi_y0
+
+    # Clip against frame bounds
+    sy0 = max(0, -y0)
+    sy1 = min(H, fH - y0)
+    sx0 = max(0, -x0)
+    sx1 = min(W, fW - x0)
+
+    if sy0 >= sy1 or sx0 >= sx1:
+        return
+
+    dy0 = y0 + sy0
+    dy1 = y0 + sy1
+    dx0 = x0 + sx0
+    dx1 = x0 + sx1
+
+    if alpha_mult < 0.999:
+        if sprite.alpha_f is not None and sprite.sprite_bgr_f is not None:
+            sub_alpha = sprite.alpha_f[sy0:sy1, sx0:sx1] * alpha_mult
+            sub_inv = 1.0 - sub_alpha
+            sub_pre = sprite.sprite_bgr_f[sy0:sy1, sx0:sx1] * sub_alpha
+        else:
+            sub_inv = sprite.inv_alpha[sy0:sy1, sx0:sx1]
+            sub_pre = sprite.sprite_pre[sy0:sy1, sx0:sx1] * alpha_mult
+    else:
+        sub_inv = sprite.inv_alpha[sy0:sy1, sx0:sx1]
+        sub_pre = sprite.sprite_pre[sy0:sy1, sx0:sx1]
+
+    roi = frame[dy0:dy1, dx0:dx1].astype(np.float32)
+    frame[dy0:dy1, dx0:dx1] = np.clip(
+        np.round(roi * sub_inv + sub_pre),
+        0, 255
+    ).astype(np.uint8)
 
 
 @dataclass
@@ -135,6 +293,17 @@ class CaptionStyle:
     chunk_fade_in: bool = False                                       # Alpha ramp on chunk entry
     chunk_fade_duration: float = 0.12                                 # Seconds
     bottom_offset_adjust: int = 0                                     # Pixel shift relative to bottom_offset
+
+    # Kinetic Animation Extensions
+    word_entrance: bool = False                                       # Per-word entrance (0.6 -> 1.08 -> 1.0)
+    word_entrance_frames: int = 7                                     # Frames over which entrance plays
+    active_pop: bool = False                                          # Active pop (1.0 -> 1.15 -> 1.05) & y-slide
+    active_pop_frames: int = 6                                        # Frames over which active pop plays
+    active_y_slide: int = -4                                          # Max y-slide during active pop (pixels)
+    emphasis_color: Optional[Tuple[int, int, int]] = None             # Distinct color for emphasis words
+    emphasis_scale: float = 1.0                                       # Size multiplier for emphasis words
+    layout_mode: str = "chunk"                                        # "chunk" (single line) or "rolling" (2-line)
+    roll_frames: int = 6                                              # Frames for 2-line rolling slide
 
 
 # ── Preset Style Catalog ─────────────────────────────────────────────────────────────
@@ -333,6 +502,47 @@ CAPTION_STYLES: Dict[str, CaptionStyle] = {
         glow_radius=14,
         glow_stroke=8,
     ),
+    "kinetic-pop": CaptionStyle(
+        name="kinetic-pop",
+        description="Kinetic typography: dynamic per-word entrance (0.6->1.08->1.0), active word pop (1.15x) with y-slide, and coral emphasis bump.",
+        active_color=(255, 235, 59),               # Radiant Sun Yellow
+        inactive_color=(255, 255, 255),           # Pure Crisp White
+        stroke_color=(0, 0, 0),                   # Solid Black Stroke
+        stroke_width=4,
+        font_family="montserrat",
+        uppercase=True,
+        word_bounce=True,
+        bounce_scale=1.0,                         # Managed via animated profiles
+        word_entrance=True,
+        word_entrance_frames=7,
+        active_pop=True,
+        active_pop_frames=6,
+        active_y_slide=-4,
+        emphasis_color=(255, 82, 82),             # Radiant Coral Red
+        emphasis_scale=1.15,
+        layout_mode="chunk",
+    ),
+    "kinetic-roll": CaptionStyle(
+        name="kinetic-roll",
+        description="2-line teleprompter rolling layout: upcoming line 2 smoothly rolls up into line 1 over 6 frames, with active pop and dimmed future words.",
+        active_color=(255, 240, 0),               # Bold Warm Yellow
+        inactive_color=(255, 255, 255),           # Pure Crisp White
+        stroke_color=(0, 0, 0),                   # Solid Black Stroke
+        stroke_width=4,
+        font_family="montserrat",
+        uppercase=True,
+        word_bounce=True,
+        bounce_scale=1.0,
+        future_alpha=140,                         # Dimmed upcoming line 2 words
+        past_alpha=200,
+        active_pop=True,
+        active_pop_frames=6,
+        active_y_slide=-3,
+        emphasis_color=(255, 82, 82),             # Radiant Coral Red
+        emphasis_scale=1.15,
+        layout_mode="rolling",
+        roll_frames=6,
+    ),
 }
 
 STYLE_ALIASES: Dict[str, str] = {
@@ -368,6 +578,16 @@ STYLE_ALIASES: Dict[str, str] = {
     "subtitles": "subtitle-16x9",
     "16x9": "subtitle-16x9",
     "16:9": "subtitle-16x9",
+    "kinetic-pop": "kinetic-pop",
+    "pop": "kinetic-pop",
+    "kinetic": "kinetic-pop",
+    "punchy": "kinetic-pop",
+    "kinetic-roll": "kinetic-roll",
+    "roll": "kinetic-roll",
+    "rolling": "kinetic-roll",
+    "teleprompter": "kinetic-roll",
+    "2line": "kinetic-roll",
+    "two-line": "kinetic-roll",
 }
 
 
@@ -505,14 +725,80 @@ class CaptionRenderer:
         self.stroke_color = self.style.stroke_color
         self.stroke_width = self.style.stroke_width
 
-    def build_chunks(self, words: List[WordCaption]) -> List[CaptionChunk]:
-        """Group individual words into presentation chunks of chunk_size."""
-        chunks: List[CaptionChunk] = []
-        for i in range(0, len(words), self.chunk_size):
-            chunk_words = words[i:i + self.chunk_size]
-            if chunk_words:
-                chunks.append(CaptionChunk(words=chunk_words))
-        return chunks
+    def build_chunks(
+        self,
+        words: List[WordCaption],
+        video_width: Optional[int] = None,
+        max_words_per_chunk: Optional[int] = None,
+    ) -> List[CaptionChunk]:
+        """
+        Group individual words into presentation chunks using a greedy pixel-width chunker
+        that breaks on pauses > 0.3s, terminal punctuation, or canvas boundary overflow.
+        """
+        if not words:
+            return []
+
+        w_canvas = video_width if video_width is not None else 1080
+        bg_pad_x = self.style.chunk_bg_padding[0] if self.style.chunk_bg else 0
+        max_allowed_w = max(100.0, float(w_canvas - 80 - bg_pad_x * 2))
+
+        # Use style font family to accurately measure widths
+        meas_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        ref_font_size = 56 if w_canvas >= 720 else 36
+        font = self.font_mgr.get_font(ref_font_size, font_family=self.style.font_family)
+        space_w = meas_draw.textlength(" ", font=font) * 1.15
+
+        max_w_count = max_words_per_chunk if max_words_per_chunk is not None else max(self.chunk_size, 4)
+
+        raw_chunks: List[List[WordCaption]] = []
+        curr_words: List[WordCaption] = []
+        curr_width: float = 0.0
+
+        for w in words:
+            txt = w.word.upper() if self.style.uppercase else w.word
+            w_len = meas_draw.textlength(txt, font=font)
+
+            break_chunk = False
+            if curr_words:
+                prev_w = curr_words[-1]
+                # 1. Natural speech pause / breath gap > 0.30s
+                if (w.start - prev_w.end) > 0.30:
+                    break_chunk = True
+                # 2. Terminal punctuation on previous word
+                elif has_terminal_punct(prev_w.word) or has_terminal_punct(getattr(prev_w, "raw_token", "")):
+                    break_chunk = True
+                # 3. Canvas horizontal overflow
+                elif (curr_width + space_w + w_len) > max_allowed_w:
+                    break_chunk = True
+                # 4. Maximum words per chunk limit
+                elif len(curr_words) >= max_w_count:
+                    break_chunk = True
+
+            if break_chunk:
+                raw_chunks.append(curr_words)
+                curr_words = [w]
+                curr_width = w_len
+            else:
+                if curr_words:
+                    curr_width += space_w + w_len
+                else:
+                    curr_width = w_len
+                curr_words.append(w)
+
+        if curr_words:
+            raw_chunks.append(curr_words)
+
+        # Orphan rebalancing: avoid leaving a single isolated word at the end of a clause
+        if len(raw_chunks) >= 2 and len(raw_chunks[-1]) == 1 and len(raw_chunks[-2]) >= 3:
+            last_w = raw_chunks[-1][0]
+            prev_w = raw_chunks[-2][-1]
+            prev_prev = raw_chunks[-2][-2]
+            if (last_w.start - prev_w.end <= 0.30 and
+                not has_terminal_punct(prev_prev.word) and
+                not has_terminal_punct(getattr(prev_prev, "raw_token", ""))):
+                raw_chunks[-1].insert(0, raw_chunks[-2].pop())
+
+        return [CaptionChunk(words=c) for c in raw_chunks]
 
     def calculate_layouts(self, chunks: List[CaptionChunk], video_width: int, video_height: Optional[int] = None) -> None:
         """Precompute optimal font size and word widths for each chunk."""
@@ -566,21 +852,30 @@ class CaptionRenderer:
         width: int,
         height: int,
         y_pos: int,
+        active_scale_mult: float = 1.0,
+        active_y_shift: int = 0,
+        override_active_color: Optional[Tuple[int, int, int]] = None,
     ) -> Optional[CaptionSprite]:
         """
         Pre-render a single (chunk, active_word_idx) state into a tight RGBA sprite
         with premultiplied alpha and bounding coordinates on the target canvas.
+        Supports active word scale multipliers, y-shifts, and color overrides for animation steps.
         """
         if not chunk.meta:
             return None
 
         meta = chunk.meta
         base_font = self.font_mgr.get_font(meta.font_size, font_family=self.style.font_family)
-        active_font = (
-            self.font_mgr.get_font(int(meta.font_size * self.style.bounce_scale), font_family=self.style.font_family)
-            if self.style.word_bounce
-            else base_font
-        )
+        if active_scale_mult != 1.0:
+            eff_bounce_scale = (self.style.bounce_scale if self.style.word_bounce else 1.0) * active_scale_mult
+            active_font = self.font_mgr.get_font(int(round(meta.font_size * eff_bounce_scale)), font_family=self.style.font_family)
+            bounce_extra = int(meta.font_size * abs(eff_bounce_scale - 1.0)) + abs(self.style.bounce_y_offset) + abs(active_y_shift)
+        elif self.style.word_bounce:
+            active_font = self.font_mgr.get_font(int(meta.font_size * self.style.bounce_scale), font_family=self.style.font_family)
+            bounce_extra = int(meta.font_size * abs(self.style.bounce_scale - 1.0)) + abs(self.style.bounce_y_offset)
+        else:
+            active_font = base_font
+            bounce_extra = 0
 
         x_start = (width - meta.total_width) / 2.0
         pad_x, pad_y = self.style.chunk_bg_padding if self.style.chunk_bg else (0, 0)
@@ -596,7 +891,6 @@ class CaptionRenderer:
             self.style.shadow_3d_depth if self.style.shadow_3d else 0
         )
         stroke_extra = self.style.stroke_width + 4
-        bounce_extra = int(meta.font_size * abs(self.style.bounce_scale - 1.0)) + abs(self.style.bounce_y_offset) if self.style.word_bounce else 0
 
         margin_x = max(pad_x, pad_bx) + shadow_extra_x + stroke_extra + glow_extra + bounce_extra + 16
         margin_y = max(pad_y, pad_by) + shadow_extra_y + stroke_extra + glow_extra + bounce_extra + 16
@@ -655,7 +949,8 @@ class CaptionRenderer:
                 font = active_font
                 word_len = draw.textlength(txt, font=font)
                 x_draw = x_center - word_len / 2.0
-                y_draw = y_pos_s + (self.style.bounce_y_offset if self.style.word_bounce else 0)
+                y_draw = y_pos_s + (self.style.bounce_y_offset if self.style.word_bounce else 0) + active_y_shift
+                eff_active_color = override_active_color if override_active_color is not None else self.style.active_color
 
                 if self.style.active_box_highlight:
                     bbox = draw.textbbox((x_draw, y_draw), txt, font=font)
@@ -713,7 +1008,7 @@ class CaptionRenderer:
                         (x_draw, y_draw),
                         txt,
                         font=font,
-                        fill=(*self.style.active_color, 255),
+                        fill=(*eff_active_color, 255),
                         stroke_width=self.style.stroke_width,
                         stroke_fill=(*self.style.stroke_color, 255)
                     )
@@ -1037,7 +1332,7 @@ class CaptionRenderer:
         When legacy=True:
         - Uses the original frame-by-frame PIL drawing logic (for pixel verification).
         """
-        chunks = self.build_chunks(words)
+        chunks = self.build_chunks(words, video_width=width)
         self.calculate_layouts(chunks, width, height)
 
         is_widescreen = (width > height)
@@ -1104,17 +1399,82 @@ class CaptionRenderer:
             return legacy_compose
 
         # ── Pre-Render Sprites Path (Ultra-Fast NumPy Premultiplied Alpha Blend) ──
-        sprites: Dict[Tuple[int, int], CaptionSprite] = {}
+        has_anim = bool(self.style.active_pop or self.style.word_entrance)
+        anim_steps = max(
+            self.style.active_pop_frames if self.style.active_pop else 0,
+            self.style.word_entrance_frames if self.style.word_entrance else 0
+        ) if has_anim else 1
+
+        sprites: Dict[Tuple[int, int, int], CaptionSprite] = {}
+        legacy_sprites: Dict[Tuple[int, int], CaptionSprite] = {}
+
         for c_idx, chunk in enumerate(chunks):
             if not chunk.meta:
                 continue
-            for a_idx in range(-1, len(chunk.words)):
-                sp = self._render_sprite(chunk, a_idx, width, height, y_pos)
-                if sp is not None:
-                    sprites[(c_idx, a_idx)] = sp
+
+            sp_neg = self._render_sprite(chunk, -1, width, height, y_pos)
+            if sp_neg is not None:
+                sprites[(c_idx, -1, 0)] = sp_neg
+                legacy_sprites[(c_idx, -1)] = sp_neg
+
+            for a_idx, w in enumerate(chunk.words):
+                is_emp = is_emphasis_word(w)
+                emp_scale = self.style.emphasis_scale if is_emp else 1.0
+                emp_col = self.style.emphasis_color if (is_emp and self.style.emphasis_color) else None
+
+                if not has_anim:
+                    sp = self._render_sprite(
+                        chunk, a_idx, width, height, y_pos,
+                        active_scale_mult=emp_scale,
+                        override_active_color=emp_col
+                    )
+                    if sp is not None:
+                        sprites[(c_idx, a_idx, 0)] = sp
+                        legacy_sprites[(c_idx, a_idx)] = sp
+                else:
+                    for step in range(anim_steps):
+                        scale_mult = 1.0
+                        y_shift = 0
+
+                        if self.style.active_pop:
+                            pop_s, pop_y = active_pop_profile(step, self.style.active_pop_frames)
+                            scale_mult *= pop_s
+                            y_shift += pop_y
+
+                        if self.style.word_entrance:
+                            ent_s = entrance_scale_profile(step, self.style.word_entrance_frames)
+                            scale_mult *= ent_s
+
+                        scale_mult *= emp_scale
+
+                        sp = self._render_sprite(
+                            chunk, a_idx, width, height, y_pos,
+                            active_scale_mult=scale_mult,
+                            active_y_shift=y_shift,
+                            override_active_color=emp_col
+                        )
+                        if sp is not None:
+                            sprites[(c_idx, a_idx, step)] = sp
+                            if step == 0:
+                                legacy_sprites[(c_idx, a_idx)] = sp
 
         chunk_fade_in = self.style.chunk_fade_in
         chunk_fade_dur = self.style.chunk_fade_duration
+        is_rolling = (self.style.layout_mode == "rolling")
+        roll_dur = (self.style.roll_frames / 25.0) if is_rolling else 0.0
+
+        # Calculate line spacing for 2-line rolling layout
+        base_font_sample = self.font_mgr.get_font(
+            chunks[0].meta.font_size if chunks and chunks[0].meta else 56,
+            font_family=self.style.font_family
+        )
+        meas_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        sample_bbox = meas_draw.textbbox((0, 0), "Ag", font=base_font_sample)
+        line_h = sample_bbox[3] - sample_bbox[1]
+        line_spacing = max(16, int(line_h * 0.45))
+        delta_y = line_h + line_spacing
+        y_line1 = y_pos - int(round(delta_y / 2.0))
+        y_line2 = y_line1 + delta_y
 
         def compose(frame: np.ndarray, current_time: float) -> np.ndarray:
             if not chunks:
@@ -1143,32 +1503,74 @@ class CaptionRenderer:
                 # Untouched pass-through when no caption is active
                 return frame
 
-            sprite = sprites.get((active_chunk_idx, active_word_idx))
-            if sprite is None or sprite.sprite_pre is None:
+            chunk = chunks[active_chunk_idx]
+
+            # ── 2-Line Rolling Layout Composition ──
+            if is_rolling:
+                t0 = chunk.start
+                if active_chunk_idx > 0 and (current_time - t0) < roll_dur:
+                    prog = (current_time - t0) / roll_dur
+                    e = smoothstep(0.0, 1.0, prog)
+                    yk = int(round(y_line2 - e * delta_y))
+                    y_prev = int(round(y_line1 - e * delta_y))
+                    alpha_prev = max(0.0, 1.0 - e)
+
+                    # Slide out previous chunk (Line 1 -> upwards)
+                    prev_chunk = chunks[active_chunk_idx - 1]
+                    prev_sp = sprites.get(
+                        (active_chunk_idx - 1, len(prev_chunk.words) - 1, 0),
+                        legacy_sprites.get((active_chunk_idx - 1, len(prev_chunk.words) - 1))
+                    )
+                    if prev_sp is not None:
+                        blend_sprite_to_frame(frame, prev_sp, y_override=y_prev, base_y_pos=y_pos, alpha_mult=alpha_prev)
+
+                    # Slide in active chunk (Line 2 -> Line 1)
+                    w_start = chunk.words[active_word_idx].start if active_word_idx >= 0 else t0
+                    frame_in_w = max(0, int(round((current_time - w_start) * 25.0)))
+                    step = min(frame_in_w, anim_steps - 1) if has_anim else 0
+                    sp = sprites.get((active_chunk_idx, active_word_idx, step), legacy_sprites.get((active_chunk_idx, active_word_idx)))
+                    if sp is not None:
+                        blend_sprite_to_frame(frame, sp, y_override=yk, base_y_pos=y_pos)
+
+                    # Fade in upcoming chunk on Line 2
+                    if active_chunk_idx + 1 < len(chunks):
+                        next_sp = sprites.get((active_chunk_idx + 1, -1, 0), legacy_sprites.get((active_chunk_idx + 1, -1)))
+                        if next_sp is not None:
+                            blend_sprite_to_frame(frame, next_sp, y_override=y_line2, base_y_pos=y_pos, alpha_mult=e)
+                else:
+                    # Stationary active chunk on Line 1
+                    w_start = chunk.words[active_word_idx].start if active_word_idx >= 0 else t0
+                    frame_in_w = max(0, int(round((current_time - w_start) * 25.0)))
+                    step = min(frame_in_w, anim_steps - 1) if has_anim else 0
+                    sp = sprites.get((active_chunk_idx, active_word_idx, step), legacy_sprites.get((active_chunk_idx, active_word_idx)))
+                    if sp is not None:
+                        blend_sprite_to_frame(frame, sp, y_override=y_line1, base_y_pos=y_pos)
+
+                    # Stationary upcoming chunk on Line 2 (dimmed with future_alpha)
+                    if active_chunk_idx + 1 < len(chunks):
+                        next_sp = sprites.get((active_chunk_idx + 1, -1, 0), legacy_sprites.get((active_chunk_idx + 1, -1)))
+                        if next_sp is not None:
+                            blend_sprite_to_frame(frame, next_sp, y_override=y_line2, base_y_pos=y_pos)
+
                 return frame
 
-            y0, y1 = sprite.roi_y0, sprite.roi_y1
-            x0, x1 = sprite.roi_x0, sprite.roi_x1
+            # ── Single-Line Standard / Kinetic-Pop Layout Composition ──
+            w_start = chunk.words[active_word_idx].start if active_word_idx >= 0 else active_chunk_start
+            frame_in_w = max(0, int(round((current_time - w_start) * 25.0)))
+            step = min(frame_in_w, anim_steps - 1) if has_anim else 0
+
+            sprite = sprites.get((active_chunk_idx, active_word_idx, step), legacy_sprites.get((active_chunk_idx, active_word_idx)))
+            if sprite is None or sprite.sprite_pre is None:
+                return frame
 
             if chunk_fade_in:
                 dt = current_time - active_chunk_start
                 if 0.0 <= dt < chunk_fade_dur:
                     fade_mult = max(0.1, min(1.0, dt / chunk_fade_dur))
-                    eff_alpha = sprite.alpha_f * fade_mult
-                    eff_inv_alpha = 1.0 - eff_alpha
-                    eff_sprite_pre = sprite.sprite_bgr_f * eff_alpha
-                    roi = frame[y0:y1, x0:x1]
-                    frame[y0:y1, x0:x1] = np.clip(
-                        np.round(roi.astype(np.float32) * eff_inv_alpha + eff_sprite_pre),
-                        0, 255
-                    ).astype(np.uint8)
+                    blend_sprite_to_frame(frame, sprite, alpha_mult=fade_mult)
                     return frame
 
-            roi = frame[y0:y1, x0:x1]
-            frame[y0:y1, x0:x1] = np.clip(
-                np.round(roi.astype(np.float32) * sprite.inv_alpha + sprite.sprite_pre),
-                0, 255
-            ).astype(np.uint8)
+            blend_sprite_to_frame(frame, sprite)
             return frame
 
         return compose

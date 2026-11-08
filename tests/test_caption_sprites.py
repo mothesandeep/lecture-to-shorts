@@ -85,7 +85,12 @@ class TestCaptionSpriteRendering(unittest.TestCase):
 
     def test_all_12_styles_visual_equivalence(self):
         """Verify all 12 styles maintain <= 1 max pixel difference between legacy and sprite path."""
-        for style_name in CAPTION_STYLES:
+        base_12_styles = [
+            "classic-yellow", "box-highlight", "bold-stroke", "fade-in",
+            "kalakar-fire", "karaoke-neon", "cyber-neon", "cinematic",
+            "comic-pop", "minimal", "subtitle-16x9", "ae-glow"
+        ]
+        for style_name in base_12_styles:
             with self.subTest(style=style_name):
                 r_old = CaptionRenderer(style=style_name)
                 c_old = r_old.create_composer(self.words, width=1080, height=1920, legacy=True)
