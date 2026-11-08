@@ -53,3 +53,4 @@ python3 pipeline.py run \
 2. **Audio Delay**: Applied exactly once in `av_sync.cut_snippet_accurate` (500 ms). `reframe_video` received `audio_delay_ms=0.0`.
 3. **AV Sync**: `verify_av_sync` measured `diff=0.0ms` (threshold $\le 50\,\text{ms}$) on both reframed and final captioned reels.
 4. **Framing Invariant**: Anti-corner safe zone $[0.32, 0.68]$ remained enforced throughout all 736 frames.
+
