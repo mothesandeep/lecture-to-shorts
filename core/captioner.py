@@ -1177,7 +1177,8 @@ class CaptionRenderer:
         self,
         input_video: Path | str,
         output_video: Path | str,
-        words: List[WordCaption]
+        words: List[WordCaption],
+        fast: bool = False,
     ) -> Path:
         """
         Stream frames from input_video, composite word captions using Pillow,
@@ -1215,10 +1216,16 @@ class CaptionRenderer:
             "-map", "0:v", "-map", "1:a:0",
             "-af", "asetpts=PTS-STARTPTS,aresample=async=1000:first_pts=0",
             "-fps_mode", "cfr",
-            "-c:v", "libx264", "-preset", self.preset, "-crf", str(self.crf), "-pix_fmt", "yuv420p",
+        ]
+        if fast:
+            ffmpeg_cmd.extend(["-c:v", "h264_videotoolbox", "-b:v", "12M", "-pix_fmt", "yuv420p"])
+        else:
+            ffmpeg_cmd.extend(["-c:v", "libx264", "-preset", self.preset, "-crf", str(self.crf), "-pix_fmt", "yuv420p"])
+
+        ffmpeg_cmd.extend([
             "-c:a", "aac", "-b:a", "192k", "-shortest",
             "-movflags", "+faststart", str(out_path)
-        ]
+        ])
         proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
 
         frame_idx = 0

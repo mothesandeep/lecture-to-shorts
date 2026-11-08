@@ -732,7 +732,7 @@ class FaceReframer:
             static_centers=static_centers,
         )
 
-    def render(self, plan: Optional[ReframePlan] = None) -> Path:
+    def render(self, plan: Optional[ReframePlan] = None, fast: bool = False) -> Path:
         """
         Execute pass 3 of face reframing:
         Encode the cropped frames to out_path using FFmpeg rawvideo pipe.
@@ -756,6 +756,8 @@ class FaceReframer:
         zoom = plan.zoom
 
         # ---------------- PASS 3: FFmpeg Rendering & Encoding ----------------
+        enc_args = ["-c:v", "h264_videotoolbox", "-b:v", "12M"] if fast else ["-c:v", "libx264", "-preset", plan.encoder_preset, "-crf", str(plan.crf)]
+
         if plan.layout == "blur-bw":
             print(f"[reframe] Encoding 9:16 aesthetic blur-bw video via FFmpeg filter_complex -> {out_path}")
             filter_complex = (
@@ -771,10 +773,13 @@ class FaceReframer:
                 "-filter_complex", filter_complex,
                 "-map", "[v]", "-map", "[a]",
                 "-fps_mode", "cfr",
-                "-c:v", "libx264", "-preset", plan.encoder_preset, "-crf", str(plan.crf), "-pix_fmt", "yuv420p",
+            ]
+            ffmpeg_cmd.extend(enc_args)
+            ffmpeg_cmd.extend([
+                "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", plan.audio_bitrate, "-shortest",
                 "-movflags", "+faststart", str(out_path)
-            ]
+            ])
         else:
             scale_desc = f"{out_canvas_w}x{out_canvas_h} {'4:5 feed' if is_4_5 else '9:16 vertical'}"
             print(f"[reframe] Encoding {scale_desc} direct-crop video via FFmpeg pipe -> {out_path}")
@@ -786,10 +791,12 @@ class FaceReframer:
                 "-vf", f"scale={out_canvas_w}:{out_canvas_h}:flags=lanczos,format=yuv420p",
                 "-af", "asetpts=PTS-STARTPTS,aresample=async=1000:first_pts=0",
                 "-fps_mode", "cfr",
-                "-c:v", "libx264", "-preset", plan.encoder_preset, "-crf", str(plan.crf),
+            ]
+            ffmpeg_cmd.extend(enc_args)
+            ffmpeg_cmd.extend([
                 "-c:a", "aac", "-b:a", plan.audio_bitrate, "-shortest",
                 "-movflags", "+faststart", str(out_path)
-            ]
+            ])
 
         proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
 
@@ -854,10 +861,10 @@ class FaceReframer:
         print(f"[reframe] Success! Reframed video created at: {out_path}")
         return out_path
 
-    def run(self) -> Path:
+    def run(self, fast: bool = False) -> Path:
         """Execute reframing: plan passes 1-2.7 and render pass 3 in sequence."""
         plan = self.plan()
-        return self.render(plan)
+        return self.render(plan, fast=fast)
 
 
 def reframe_video(
@@ -878,6 +885,7 @@ def reframe_video(
     scene_cut_threshold: Optional[float] = None,
     layout: str = "direct-crop",
     audio_delay_ms: float = 0.0,
+    fast: bool = False,
 ) -> Path:
     """Convenience functional interface for video reframing."""
     config = ReframeConfig(
@@ -900,7 +908,7 @@ def reframe_video(
         audio_delay_ms=audio_delay_ms
     )
     reframer = FaceReframer(config)
-    return reframer.run()
+    return reframer.run(fast=fast)
 
 
 if __name__ == "__main__":

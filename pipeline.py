@@ -16,14 +16,16 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import shutil
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from core.boundary_refiner import refine_clip_boundaries
 from core.captioner import CaptionRenderer, list_styles
@@ -93,7 +95,33 @@ def save_profile_json(
     return profile_json_path
 
 
-def process_single_clip(
+@dataclass
+class PreparedClip:
+    """Pre-computed assets, plans, and metadata ready for rendering."""
+    clip_info: ViralClipMetadata
+    snippet_path: Path
+    reframed_path: Path
+    temp_dir: Optional[tempfile.TemporaryDirectory]
+    plan: Optional[ReframePlan]
+    words: List
+    time_cut: float
+    time_boundary_refine: float
+    time_reframe_p1: float
+    time_reframe_render: float
+    time_whisper: float
+    time_romanize: float
+    is_widescreen: bool
+    is_4_5: bool
+    layout: str
+    target_aspect: str
+    chosen_style: str
+    effective_chunk_size: int
+    effective_bottom_offset: int
+    out_reel_path: Path
+    t_clip_overall_start: float
+
+
+def prepare_clip(
     src_video: Path,
     clip_info: ViralClipMetadata,
     output_dir: Path,
@@ -113,15 +141,12 @@ def process_single_clip(
     aspect: str = "auto",
     no_caption: bool = False,
     refine_boundaries: bool = False,
-    profile: bool = False,
     whisper_backend: str = "auto",
     legacy_render: bool = False,
-) -> Path:
+) -> PreparedClip:
     """
-    Process one viral clip end-to-end:
-    - High-Precision Boundary Re-verification (+/- 60s window) when enabled.
-    - If legacy_render: Reframe encode -> Word Whisper -> Hinglish Romanize -> Caption encode (3 encodes).
-    - If default: Reframe plan -> Word Whisper -> Unified single-pass render_reel (1 final encode).
+    Prepare clip N: snippet cut, reframing plan, word timestamps, and romanization.
+    Can be run in a background worker thread while clip N-1 is rendering.
     """
     t_clip_overall_start = time.time()
     time_boundary_refine = 0.0
@@ -130,8 +155,6 @@ def process_single_clip(
     time_reframe_render = 0.0
     time_whisper = 0.0
     time_romanize = 0.0
-    time_caption_burn = 0.0
-    time_unified_render = 0.0
 
     # 0. High-Precision Boundary Re-verification if requested
     if refine_boundaries:
@@ -183,7 +206,7 @@ def process_single_clip(
 
     render_mode_desc = "Legacy Multi-Step (--legacy-render)" if legacy_render else "Unified Single-Pass (render_reel)"
     print("\n" + "-" * 65)
-    print(f"PROCESSING {label} #{clip_info.clip_id}: \"{clip_info.title}\"")
+    print(f"PREPARING {label} #{clip_info.clip_id}: \"{clip_info.title}\"")
     print(f"Duration: {clip_info.duration:.1f}s ({format_seconds_to_timestamp(clip_info.start_time)} -> {format_seconds_to_timestamp(clip_info.end_time)})")
     print(f"Aspect Ratio: {target_aspect} | Canvas Layout: {layout} | Render Mode: {render_mode_desc}")
     print(f"Captions: {'Disabled (--no-caption)' if no_caption else f'Enabled ({style})'}")
@@ -202,74 +225,50 @@ def process_single_clip(
         snippet_path = Path(temp_dir.name) / "snippet.mp4"
         reframed_path = Path(temp_dir.name) / "reframed.mp4"
 
-    try:
-        # Step A: Cut snippet with accurate timestamp zeroing & audio delay lip-sync (high quality CRF<=12)
-        print(f"\n[Clip {clip_info.clip_id}] [1/4] Cutting snippet from {clip_info.start_time:.1f}s to {clip_info.end_time:.1f}s (audio_delay={audio_delay_ms:.0f}ms, crf=10)...")
-        t0 = time.time()
-        cut_snippet_without_reencode(
-            src_video,
-            snippet_path,
-            clip_info.start_time,
-            clip_info.end_time,
-            audio_delay_ms=audio_delay_ms,
-            crf=10,
-        )
-        time_cut = time.time() - t0
-        print(f"[Clip {clip_info.clip_id}] Snippet cut in {time_cut:.2f}s")
+    # Step A: Cut snippet with accurate timestamp zeroing & audio delay lip-sync (high quality CRF<=12)
+    print(f"\n[Clip {clip_info.clip_id}] [1/4] Cutting snippet from {clip_info.start_time:.1f}s to {clip_info.end_time:.1f}s (audio_delay={audio_delay_ms:.0f}ms, crf=10)...")
+    t0 = time.time()
+    cut_snippet_without_reencode(
+        src_video,
+        snippet_path,
+        clip_info.start_time,
+        clip_info.end_time,
+        audio_delay_ms=audio_delay_ms,
+        crf=10,
+    )
+    time_cut = time.time() - t0
+    print(f"[Clip {clip_info.clip_id}] Snippet cut in {time_cut:.2f}s")
 
-        if legacy_render:
-            # ── Legacy Multi-Step Render Path ─────────────────────────────────────
-            # Step B: Reframe to intermediate video
-            if is_widescreen:
-                print(f"\n[Clip {clip_info.clip_id}] [2/4] Preserving native 16:9 widescreen format (bypassing FaceReframer)...")
-                active_video_path = snippet_path
-                time_reframe_p1 = 0.0
-                time_reframe_render = 0.0
-            else:
-                reframe_label = "4:5 portrait" if is_4_5 else ("1:1 blur-bw" if layout == "blur-bw" else "9:16 vertical")
-                print(f"\n[Clip {clip_info.clip_id}] [2/4] Face-tracking {reframe_label} reframing (layout={layout}, aspect={target_aspect})...")
-                reframe_cfg = ReframeConfig(
-                    src=snippet_path,
-                    out=reframed_path,
-                    smooth_alpha=smooth_alpha,
-                    preset=reframe_preset,
-                    layout=layout,
-                    audio_delay_ms=0.0,
-                    aspect_ratio=target_aspect
-                )
-                reframer = FaceReframer(reframe_cfg)
-                reframer.run()
-                active_video_path = reframed_path
-                time_reframe_p1 = getattr(reframer, "time_pass1", 0.0)
-                time_reframe_render = getattr(reframer, "time_render", 0.0)
+    plan: Optional[ReframePlan] = None
+    words = []
 
-            # Step C & D: Handle optional captioning
-            if no_caption:
-                print(f"\n[Clip {clip_info.clip_id}] [3/4 & 4/4] Captions disabled (--no-caption). Saving clean video...")
-                shutil.copy2(active_video_path, out_reel_path)
-                print(f"\n>>> {'CLIP' if is_widescreen else 'REEL'} #{clip_info.clip_id} READY: {out_reel_path.name}")
-                if profile:
-                    stage_timings: Dict[str, float] = {
-                        "cut": round(time_cut, 3),
-                        "boundary refine": round(time_boundary_refine, 3),
-                        "reframe pass 1": round(time_reframe_p1, 3),
-                        "reframe render": round(time_reframe_render, 3),
-                        "whisper": round(time_whisper, 3),
-                        "gemini romanize": round(time_romanize, 3),
-                        "caption burn": round(time_caption_burn, 3),
-                    }
-                    clip_title = f"Clip #{clip_info.clip_id:02d} ({clip_info.slug})"
-                    print_profile_table(stage_timings, clip_title=clip_title)
-                    save_profile_json(
-                        output_dir=output_dir,
-                        out_reel_path=out_reel_path,
-                        clip_info=clip_info,
-                        stage_timings=stage_timings,
-                        total_wall_time=time.time() - t_clip_overall_start
-                    )
-                return out_reel_path
+    if legacy_render:
+        # Step B: Reframe to intermediate video
+        if is_widescreen:
+            print(f"\n[Clip {clip_info.clip_id}] [2/4] Preserving native 16:9 widescreen format (bypassing FaceReframer)...")
+            active_video_path = snippet_path
+            time_reframe_p1 = 0.0
+            time_reframe_render = 0.0
+        else:
+            reframe_label = "4:5 portrait" if is_4_5 else ("1:1 blur-bw" if layout == "blur-bw" else "9:16 vertical")
+            print(f"\n[Clip {clip_info.clip_id}] [2/4] Face-tracking {reframe_label} reframing (layout={layout}, aspect={target_aspect})...")
+            reframe_cfg = ReframeConfig(
+                src=snippet_path,
+                out=reframed_path,
+                smooth_alpha=smooth_alpha,
+                preset=reframe_preset,
+                layout=layout,
+                audio_delay_ms=0.0,
+                aspect_ratio=target_aspect
+            )
+            reframer = FaceReframer(reframe_cfg)
+            reframer.run()
+            active_video_path = reframed_path
+            time_reframe_p1 = getattr(reframer, "time_pass1", 0.0)
+            time_reframe_render = getattr(reframer, "time_render", 0.0)
 
-            # Word-level Whisper transcription & Gemini Hinglish romanization
+        # Step C: Word-level Whisper transcription & Gemini Hinglish romanization
+        if not no_caption:
             print(f"\n[Clip {clip_info.clip_id}] [3/4] Word-level Whisper STT & Hinglish transliteration...")
             transcriber = HinglishTranscriber(
                 whisper_model=whisper_clip_model,
@@ -288,43 +287,134 @@ def process_single_clip(
             )
             time_whisper = getattr(transcriber, "time_whisper", 0.0)
             time_romanize = getattr(transcriber, "time_romanize", 0.0)
-
-            # Burn animated word captions via Pillow & FFmpeg
-            print(f"\n[Clip {clip_info.clip_id}] [4/4] Burning animated captions to final video...")
-            chosen_style = style
-            effective_chunk_size = chunk_size
-            effective_bottom_offset = bottom_offset
-
-            if is_widescreen:
-                if style == "classic-yellow":
-                    chosen_style = "subtitle-16x9"
-                if chunk_size == 4:
-                    effective_chunk_size = 6
-                if bottom_offset == 380:
-                    effective_bottom_offset = 100
-
-            renderer = CaptionRenderer(
-                chunk_size=effective_chunk_size,
-                bottom_offset=effective_bottom_offset,
-                style=chosen_style
+    else:
+        # Step B: Compute reframing plan (trajectory, geometry, scene cuts)
+        if is_widescreen:
+            print(f"\n[Clip {clip_info.clip_id}] [2/4] Preserving native 16:9 widescreen format (bypassing FaceReframer)...")
+            time_reframe_p1 = 0.0
+        else:
+            reframe_label = "4:5 portrait" if is_4_5 else ("1:1 blur-bw" if layout == "blur-bw" else "9:16 vertical")
+            print(f"\n[Clip {clip_info.clip_id}] [2/4] Planning face-tracking {reframe_label} reframing (layout={layout}, aspect={target_aspect})...")
+            reframe_cfg = ReframeConfig(
+                src=snippet_path,
+                out=reframed_path,
+                smooth_alpha=smooth_alpha,
+                preset=reframe_preset,
+                layout=layout,
+                audio_delay_ms=0.0,
+                aspect_ratio=target_aspect
             )
-            t_burn_start = time.time()
-            renderer.render_to_video(
-                input_video=active_video_path,
-                output_video=out_reel_path,
-                words=words
-            )
-            time_caption_burn = time.time() - t_burn_start
+            reframer = FaceReframer(reframe_cfg)
+            plan = reframer.plan()
+            time_reframe_p1 = getattr(reframer, "time_pass1", 0.0)
+            if save_intermediate:
+                reframer.render(plan)
 
-            print(f"\n>>> {'CLIP' if is_widescreen else 'REEL'} #{clip_info.clip_id} READY: {out_reel_path.name}")
+        # Step C: Word-level Whisper transcription & Gemini Hinglish romanization
+        if not no_caption:
+            print(f"\n[Clip {clip_info.clip_id}] [3/4] Word-level Whisper STT & Hinglish transliteration...")
+            transcriber = HinglishTranscriber(
+                whisper_model=whisper_clip_model,
+                llm_model=llm_model,
+                api_key=api_key,
+                no_llm=no_llm,
+                uppercase=True,
+                backend=whisper_backend,
+            )
+            words = transcriber.transcribe_and_romanize(
+                video_path=snippet_path,
+                src_lecture_video=src_video,
+                clip_start=clip_info.start_time,
+                clip_end=clip_info.end_time,
+                audio_delay_ms=audio_delay_ms,
+            )
+            time_whisper = getattr(transcriber, "time_whisper", 0.0)
+            time_romanize = getattr(transcriber, "time_romanize", 0.0)
+        else:
+            print(f"\n[Clip {clip_info.clip_id}] [3/4] Captions disabled (--no-caption). Bypassing Whisper & transliteration...")
+
+    chosen_style = style
+    effective_chunk_size = chunk_size
+    effective_bottom_offset = bottom_offset
+
+    if is_widescreen:
+        if style == "classic-yellow":
+            chosen_style = "subtitle-16x9"
+        if chunk_size == 4:
+            effective_chunk_size = 6
+        if bottom_offset == 380:
+            effective_bottom_offset = 100
+
+    return PreparedClip(
+        clip_info=clip_info,
+        snippet_path=snippet_path,
+        reframed_path=reframed_path,
+        temp_dir=temp_dir,
+        plan=plan,
+        words=words,
+        time_cut=time_cut,
+        time_boundary_refine=time_boundary_refine,
+        time_reframe_p1=time_reframe_p1,
+        time_reframe_render=time_reframe_render,
+        time_whisper=time_whisper,
+        time_romanize=time_romanize,
+        is_widescreen=is_widescreen,
+        is_4_5=is_4_5,
+        layout=layout,
+        target_aspect=target_aspect,
+        chosen_style=chosen_style,
+        effective_chunk_size=effective_chunk_size,
+        effective_bottom_offset=effective_bottom_offset,
+        out_reel_path=out_reel_path,
+        t_clip_overall_start=t_clip_overall_start,
+    )
+
+
+def render_prepared_clip(
+    prepared: PreparedClip,
+    output_dir: Path,
+    profile: bool = False,
+    legacy_render: bool = False,
+    fast: bool = False,
+    no_caption: bool = False,
+) -> Path:
+    """Render a pre-prepared clip to its final output file."""
+    try:
+        clip_info = prepared.clip_info
+        out_reel_path = prepared.out_reel_path
+        time_caption_burn = 0.0
+        time_unified_render = 0.0
+
+        if legacy_render:
+            active_video_path = prepared.reframed_path if not prepared.is_widescreen else prepared.snippet_path
+            if no_caption:
+                print(f"\n[Clip {clip_info.clip_id}] [4/4] Captions disabled (--no-caption). Saving clean video...")
+                shutil.copy2(active_video_path, out_reel_path)
+            else:
+                print(f"\n[Clip {clip_info.clip_id}] [4/4] Burning animated captions to final video...")
+                renderer = CaptionRenderer(
+                    chunk_size=prepared.effective_chunk_size,
+                    bottom_offset=prepared.effective_bottom_offset,
+                    style=prepared.chosen_style,
+                )
+                t_burn_start = time.time()
+                renderer.render_to_video(
+                    input_video=active_video_path,
+                    output_video=out_reel_path,
+                    words=prepared.words,
+                    fast=fast,
+                )
+                time_caption_burn = time.time() - t_burn_start
+
+            print(f"\n>>> {'CLIP' if prepared.is_widescreen else 'REEL'} #{clip_info.clip_id} READY: {out_reel_path.name}")
             if profile:
-                stage_timings = {
-                    "cut": round(time_cut, 3),
-                    "boundary refine": round(time_boundary_refine, 3),
-                    "reframe pass 1": round(time_reframe_p1, 3),
-                    "reframe render": round(time_reframe_render, 3),
-                    "whisper": round(time_whisper, 3),
-                    "gemini romanize": round(time_romanize, 3),
+                stage_timings: Dict[str, float] = {
+                    "cut": round(prepared.time_cut, 3),
+                    "boundary refine": round(prepared.time_boundary_refine, 3),
+                    "reframe pass 1": round(prepared.time_reframe_p1, 3),
+                    "reframe render": round(prepared.time_reframe_render, 3),
+                    "whisper": round(prepared.time_whisper, 3),
+                    "gemini romanize": round(prepared.time_romanize, 3),
                     "caption burn": round(time_caption_burn, 3),
                 }
                 clip_title = f"Clip #{clip_info.clip_id:02d} ({clip_info.slug})"
@@ -334,95 +424,36 @@ def process_single_clip(
                     out_reel_path=out_reel_path,
                     clip_info=clip_info,
                     stage_timings=stage_timings,
-                    total_wall_time=time.time() - t_clip_overall_start
+                    total_wall_time=time.time() - prepared.t_clip_overall_start
                 )
             return out_reel_path
 
         else:
-            # ── Modern Single-Pass Render Path (render_reel) ───────────────────────
-            # Step B: Compute reframing plan (trajectory, geometry, scene cuts)
-            plan: Optional[ReframePlan] = None
-            if is_widescreen:
-                print(f"\n[Clip {clip_info.clip_id}] [2/4] Preserving native 16:9 widescreen format (bypassing FaceReframer)...")
-                time_reframe_p1 = 0.0
-            else:
-                reframe_label = "4:5 portrait" if is_4_5 else ("1:1 blur-bw" if layout == "blur-bw" else "9:16 vertical")
-                print(f"\n[Clip {clip_info.clip_id}] [2/4] Planning face-tracking {reframe_label} reframing (layout={layout}, aspect={target_aspect})...")
-                reframe_cfg = ReframeConfig(
-                    src=snippet_path,
-                    out=reframed_path,
-                    smooth_alpha=smooth_alpha,
-                    preset=reframe_preset,
-                    layout=layout,
-                    audio_delay_ms=0.0,
-                    aspect_ratio=target_aspect
-                )
-                reframer = FaceReframer(reframe_cfg)
-                plan = reframer.plan()
-                time_reframe_p1 = getattr(reframer, "time_pass1", 0.0)
-                if save_intermediate:
-                    reframer.render(plan)
-
-            # Step C: Word-level Whisper transcription & Gemini Hinglish romanization
-            words = []
-            if not no_caption:
-                print(f"\n[Clip {clip_info.clip_id}] [3/4] Word-level Whisper STT & Hinglish transliteration...")
-                transcriber = HinglishTranscriber(
-                    whisper_model=whisper_clip_model,
-                    llm_model=llm_model,
-                    api_key=api_key,
-                    no_llm=no_llm,
-                    uppercase=True,
-                    backend=whisper_backend,
-                )
-                words = transcriber.transcribe_and_romanize(
-                    video_path=snippet_path,
-                    src_lecture_video=src_video,
-                    clip_start=clip_info.start_time,
-                    clip_end=clip_info.end_time,
-                    audio_delay_ms=audio_delay_ms,
-                )
-                time_whisper = getattr(transcriber, "time_whisper", 0.0)
-                time_romanize = getattr(transcriber, "time_romanize", 0.0)
-            else:
-                print(f"\n[Clip {clip_info.clip_id}] [3/4] Captions disabled (--no-caption). Bypassing Whisper & transliteration...")
-
-            # Step D: Single-pass unified video encoding (crop/scale + captions -> final video)
+            # Modern Single-Pass Render Path (render_reel)
             print(f"\n[Clip {clip_info.clip_id}] [4/4] Single-pass unified video encoding (crop/scale + captions -> final video)...")
-            chosen_style = style
-            effective_chunk_size = chunk_size
-            effective_bottom_offset = bottom_offset
-
-            if is_widescreen:
-                if style == "classic-yellow":
-                    chosen_style = "subtitle-16x9"
-                if chunk_size == 4:
-                    effective_chunk_size = 6
-                if bottom_offset == 380:
-                    effective_bottom_offset = 100
-
             t_render_start = time.time()
             render_reel(
-                snippet=snippet_path,
-                plan=plan,
-                words=words if not no_caption else None,
-                style=chosen_style,
+                snippet=prepared.snippet_path,
+                plan=prepared.plan,
+                words=prepared.words if not no_caption else None,
+                style=prepared.chosen_style,
                 out_path=out_reel_path,
-                chunk_size=effective_chunk_size,
-                bottom_offset=effective_bottom_offset,
+                chunk_size=prepared.effective_chunk_size,
+                bottom_offset=prepared.effective_bottom_offset,
                 no_caption=no_caption,
+                fast=fast,
             )
             time_unified_render = time.time() - t_render_start
 
-            print(f"\n>>> {'CLIP' if is_widescreen else 'REEL'} #{clip_info.clip_id} READY: {out_reel_path.name}")
+            print(f"\n>>> {'CLIP' if prepared.is_widescreen else 'REEL'} #{clip_info.clip_id} READY: {out_reel_path.name}")
             if profile:
                 stage_timings = {
-                    "cut": round(time_cut, 3),
-                    "boundary refine": round(time_boundary_refine, 3),
-                    "reframe pass 1": round(time_reframe_p1, 3),
+                    "cut": round(prepared.time_cut, 3),
+                    "boundary refine": round(prepared.time_boundary_refine, 3),
+                    "reframe pass 1": round(prepared.time_reframe_p1, 3),
                     "reframe render": 0.0,
-                    "whisper": round(time_whisper, 3),
-                    "gemini romanize": round(time_romanize, 3),
+                    "whisper": round(prepared.time_whisper, 3),
+                    "gemini romanize": round(prepared.time_romanize, 3),
                     "caption burn": 0.0,
                     "unified render": round(time_unified_render, 3),
                 }
@@ -433,13 +464,161 @@ def process_single_clip(
                     out_reel_path=out_reel_path,
                     clip_info=clip_info,
                     stage_timings=stage_timings,
-                    total_wall_time=time.time() - t_clip_overall_start
+                    total_wall_time=time.time() - prepared.t_clip_overall_start
                 )
             return out_reel_path
-
     finally:
-        if temp_dir is not None:
-            temp_dir.cleanup()
+        if prepared.temp_dir is not None:
+            prepared.temp_dir.cleanup()
+
+
+def process_single_clip(
+    src_video: Path,
+    clip_info: ViralClipMetadata,
+    output_dir: Path,
+    output_path: Optional[Path] = None,
+    whisper_clip_model: str = "large-v3",
+    llm_model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    smooth_alpha: float = 0.06,
+    chunk_size: int = 4,
+    bottom_offset: int = 380,
+    save_intermediate: bool = False,
+    no_llm: bool = False,
+    style: str = "classic-yellow",
+    reframe_preset: str = "talking_head",
+    layout: str = "direct-crop",
+    audio_delay_ms: float = 500.0,
+    aspect: str = "auto",
+    no_caption: bool = False,
+    refine_boundaries: bool = False,
+    profile: bool = False,
+    whisper_backend: str = "auto",
+    legacy_render: bool = False,
+    fast: bool = False,
+) -> Path:
+    """Process a single clip through prepare + render."""
+    prepared = prepare_clip(
+        src_video=src_video,
+        clip_info=clip_info,
+        output_dir=output_dir,
+        output_path=output_path,
+        whisper_clip_model=whisper_clip_model,
+        llm_model=llm_model,
+        api_key=api_key,
+        smooth_alpha=smooth_alpha,
+        chunk_size=chunk_size,
+        bottom_offset=bottom_offset,
+        save_intermediate=save_intermediate,
+        no_llm=no_llm,
+        style=style,
+        reframe_preset=reframe_preset,
+        layout=layout,
+        audio_delay_ms=audio_delay_ms,
+        aspect=aspect,
+        no_caption=no_caption,
+        refine_boundaries=refine_boundaries,
+        whisper_backend=whisper_backend,
+        legacy_render=legacy_render,
+    )
+    return render_prepared_clip(
+        prepared=prepared,
+        output_dir=output_dir,
+        profile=profile,
+        legacy_render=legacy_render,
+        fast=fast,
+        no_caption=no_caption,
+    )
+
+
+def process_clips_pipelined(
+    clips: List[ViralClipMetadata],
+    src_video: Path,
+    output_dir: Path,
+    whisper_clip_model: str = "large-v3",
+    llm_model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    smooth_alpha: float = 0.06,
+    chunk_size: int = 4,
+    bottom_offset: int = 380,
+    save_intermediate: bool = False,
+    no_llm: bool = False,
+    style: str = "classic-yellow",
+    reframe_preset: str = "talking_head",
+    layout: str = "direct-crop",
+    audio_delay_ms: float = 500.0,
+    aspect: str = "auto",
+    no_caption: bool = False,
+    refine_boundaries: bool = False,
+    profile: bool = False,
+    whisper_backend: str = "auto",
+    legacy_render: bool = False,
+    fast: bool = False,
+) -> Tuple[List[Path], List[dict]]:
+    """
+    Process multiple clips with pipelined preparation:
+    Clip N+1 is prepared in a background ThreadPoolExecutor(max_workers=1)
+    while clip N is being rendered. Respects Gemini API rate limits with
+    sequential preparation and persistent caching.
+    """
+    generated_reels: List[Path] = []
+    metadata_list: List[dict] = []
+
+    if not clips:
+        return generated_reels, metadata_list
+
+    def _do_prepare(clip: ViralClipMetadata) -> PreparedClip:
+        return prepare_clip(
+            src_video=src_video,
+            clip_info=clip,
+            output_dir=output_dir,
+            whisper_clip_model=whisper_clip_model,
+            llm_model=llm_model,
+            api_key=api_key,
+            smooth_alpha=smooth_alpha,
+            chunk_size=chunk_size,
+            bottom_offset=bottom_offset,
+            save_intermediate=save_intermediate,
+            no_llm=no_llm,
+            style=style,
+            reframe_preset=reframe_preset,
+            layout=layout,
+            audio_delay_ms=audio_delay_ms,
+            aspect=aspect,
+            no_caption=no_caption,
+            refine_boundaries=refine_boundaries,
+            whisper_backend=whisper_backend,
+            legacy_render=legacy_render,
+        )
+
+    # Use ThreadPoolExecutor(max_workers=1) to pipeline preparation of clip N+1 while clip N renders
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future_next = executor.submit(_do_prepare, clips[0])
+        for idx in range(len(clips)):
+            prepared = future_next.result()
+
+            # Start background preparation for clip N+1 while clip N renders
+            if idx + 1 < len(clips):
+                future_next = executor.submit(_do_prepare, clips[idx + 1])
+            else:
+                future_next = None
+
+            reel_file = render_prepared_clip(
+                prepared=prepared,
+                output_dir=output_dir,
+                profile=profile,
+                legacy_render=legacy_render,
+                fast=fast,
+                no_caption=no_caption,
+            )
+            generated_reels.append(reel_file)
+
+            meta_dict = clips[idx].model_dump()
+            meta_dict["output_file"] = str(reel_file)
+            meta_dict["filename"] = reel_file.name
+            metadata_list.append(meta_dict)
+
+    return generated_reels, metadata_list
 
 
 def handle_run(args: argparse.Namespace) -> None:
@@ -493,39 +672,31 @@ def handle_run(args: argparse.Namespace) -> None:
         print(f"     Hook: \"{c.hook}\"")
         print(f"     Why : {c.reason}\n")
 
-    # 2. Process each clip through Reframe + Caption Pipeline
-    generated_reels: List[Path] = []
-    metadata_list = []
-
-    for clip in clips:
-        reel_file = process_single_clip(
-            src_video=input_path,
-            clip_info=clip,
-            output_dir=output_dir,
-            whisper_clip_model=args.whisper_clip_model,
-            llm_model=args.llm_model,
-            api_key=args.api_key,
-            smooth_alpha=args.smooth,
-            chunk_size=args.chunk_size,
-            bottom_offset=args.bottom_offset,
-            save_intermediate=args.save_intermediate,
-            no_llm=args.no_llm,
-            style=args.style,
-            reframe_preset=args.reframe_preset,
-            layout=args.layout,
-            audio_delay_ms=args.audio_delay,
-            aspect=args.aspect,
-            no_caption=args.no_caption,
-            refine_boundaries=getattr(args, "refine_boundaries", False),
-            profile=getattr(args, "profile", False),
-            whisper_backend=getattr(args, "whisper_backend", "auto"),
-            legacy_render=getattr(args, "legacy_render", False),
-        )
-        generated_reels.append(reel_file)
-        meta_dict = clip.model_dump()
-        meta_dict["output_file"] = str(reel_file)
-        meta_dict["filename"] = reel_file.name
-        metadata_list.append(meta_dict)
+    # 2. Process each clip through Reframe + Caption Pipeline (pipelined)
+    generated_reels, metadata_list = process_clips_pipelined(
+        clips=clips,
+        src_video=input_path,
+        output_dir=output_dir,
+        whisper_clip_model=args.whisper_clip_model,
+        llm_model=args.llm_model,
+        api_key=args.api_key,
+        smooth_alpha=args.smooth,
+        chunk_size=args.chunk_size,
+        bottom_offset=args.bottom_offset,
+        save_intermediate=args.save_intermediate,
+        no_llm=args.no_llm,
+        style=args.style,
+        reframe_preset=args.reframe_preset,
+        layout=args.layout,
+        audio_delay_ms=args.audio_delay,
+        aspect=args.aspect,
+        no_caption=args.no_caption,
+        refine_boundaries=getattr(args, "refine_boundaries", False),
+        profile=getattr(args, "profile", False),
+        whisper_backend=getattr(args, "whisper_backend", "auto"),
+        legacy_render=getattr(args, "legacy_render", False),
+        fast=getattr(args, "fast", False),
+    )
 
     # 3. Export Social Media Metadata JSON
     metadata_path = output_dir / "reels_metadata.json"
@@ -676,32 +847,30 @@ def handle_interactive(args: argparse.Namespace, existing_clips: Optional[List[V
     print(f"\nTarget setting: Aspect={chosen_aspect} | Layout={chosen_layout}")
     print(f"Beginning high-precision boundary re-verification and rendering for {len(selected_clips)} clip(s)...")
 
-    rendered_files: List[Path] = []
-    for clip in selected_clips:
-        out_file = process_single_clip(
-            src_video=input_path,
-            clip_info=clip,
-            output_dir=output_dir,
-            whisper_clip_model=getattr(args, "whisper_clip_model", "large-v3"),
-            llm_model=getattr(args, "llm_model", None),
-            api_key=getattr(args, "api_key", None),
-            smooth_alpha=getattr(args, "smooth", 0.06),
-            chunk_size=getattr(args, "chunk_size", 4),
-            bottom_offset=getattr(args, "bottom_offset", 380),
-            save_intermediate=getattr(args, "save_intermediate", False),
-            no_llm=getattr(args, "no_llm", False),
-            style=getattr(args, "style", "classic-yellow"),
-            reframe_preset=getattr(args, "reframe_preset", "talking_head"),
-            layout=chosen_layout,
-            audio_delay_ms=getattr(args, "audio_delay", 500.0),
-            aspect=chosen_aspect,
-            no_caption=getattr(args, "no_caption", False),
-            refine_boundaries=True,
-            profile=getattr(args, "profile", False),
-            whisper_backend=getattr(args, "whisper_backend", "auto"),
-            legacy_render=getattr(args, "legacy_render", False),
-        )
-        rendered_files.append(out_file)
+    rendered_files, _ = process_clips_pipelined(
+        clips=selected_clips,
+        src_video=input_path,
+        output_dir=output_dir,
+        whisper_clip_model=getattr(args, "whisper_clip_model", "large-v3"),
+        llm_model=getattr(args, "llm_model", None),
+        api_key=getattr(args, "api_key", None),
+        smooth_alpha=getattr(args, "smooth", 0.06),
+        chunk_size=getattr(args, "chunk_size", 4),
+        bottom_offset=getattr(args, "bottom_offset", 380),
+        save_intermediate=getattr(args, "save_intermediate", False),
+        no_llm=getattr(args, "no_llm", False),
+        style=getattr(args, "style", "classic-yellow"),
+        reframe_preset=getattr(args, "reframe_preset", "talking_head"),
+        layout=chosen_layout,
+        audio_delay_ms=getattr(args, "audio_delay", 500.0),
+        aspect=chosen_aspect,
+        no_caption=getattr(args, "no_caption", False),
+        refine_boundaries=True,
+        profile=getattr(args, "profile", False),
+        whisper_backend=getattr(args, "whisper_backend", "auto"),
+        legacy_render=getattr(args, "legacy_render", False),
+        fast=getattr(args, "fast", False),
+    )
 
     print("\n" + "=" * 70)
     print(" INTERACTIVE RENDERING COMPLETE!")
@@ -770,6 +939,7 @@ def handle_clip(args: argparse.Namespace) -> None:
         profile=getattr(args, "profile", False),
         whisper_backend=getattr(args, "whisper_backend", "auto"),
         legacy_render=getattr(args, "legacy_render", False),
+        fast=getattr(args, "fast", False),
     )
 
 
@@ -908,6 +1078,7 @@ Examples:
     p_run.add_argument("--profile", action="store_true", help="Print per-stage wall-clock timing profile and save to output/profile_<clip>.json")
     p_run.add_argument("--whisper-backend", default="auto", choices=["auto", "openai", "mlx"], help="Whisper backend engine (default: auto, mlx if installed on Apple Silicon, else openai)")
     p_run.add_argument("--legacy-render", action="store_true", help="Use legacy multi-step encoding (reframe encode -> caption encode) instead of single-pass render_reel")
+    p_run.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
 
     # Command: 'interactive'
     p_inter = subparsers.add_parser("interactive", help="Interactive clip and aspect ratio selection with boundary re-verification")
@@ -932,6 +1103,7 @@ Examples:
     p_inter.add_argument("--profile", action="store_true", help="Print per-stage wall-clock timing profile and save to output/profile_<clip>.json")
     p_inter.add_argument("--whisper-backend", default="auto", choices=["auto", "openai", "mlx"], help="Whisper backend engine (default: auto, mlx if installed on Apple Silicon, else openai)")
     p_inter.add_argument("--legacy-render", action="store_true", help="Use legacy multi-step encoding (reframe encode -> caption encode) instead of single-pass render_reel")
+    p_inter.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
 
     # Command: 'detect'
     p_detect = subparsers.add_parser("detect", help="Detect viral moments & hooks without rendering video")
@@ -984,6 +1156,7 @@ Examples:
     p_clip.add_argument("--profile", action="store_true", help="Print per-stage wall-clock timing profile and save to output/profile_<clip>.json")
     p_clip.add_argument("--whisper-backend", default="auto", choices=["auto", "openai", "mlx"], help="Whisper backend engine (default: auto, mlx if installed on Apple Silicon, else openai)")
     p_clip.add_argument("--legacy-render", action="store_true", help="Use legacy multi-step encoding (reframe encode -> caption encode) instead of single-pass render_reel")
+    p_clip.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
 
     # Command: 'reframe'
     p_reframe = subparsers.add_parser("reframe", help="Standalone face-tracking 9:16 vertical crop")
@@ -1002,6 +1175,7 @@ Examples:
     p_reframe.add_argument("--static-std", type=float, default=8.0, help="Static std threshold (default: 8.0)")
     p_reframe.add_argument("--roi-xmax", type=float, default=1.0, help="Ignore detections to the right (default: 1.0)")
     p_reframe.add_argument("--debug", action="store_true", help="Generate debug video overlay")
+    p_reframe.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
 
     # Command: 'caption'
     p_caption = subparsers.add_parser("caption", help="Standalone word-by-word captions on vertical video")
@@ -1022,6 +1196,7 @@ Examples:
     p_caption.add_argument("--no-upper", action="store_true", help="Keep text lowercase")
     p_caption.add_argument("--preview", action="store_true", help="Transcribe & print preview only without rendering")
     p_caption.add_argument("--whisper-backend", default="auto", choices=["auto", "openai", "mlx"], help="Whisper backend engine (default: auto, mlx if installed on Apple Silicon, else openai)")
+    p_caption.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
 
     # Command: 'test'
     p_test = subparsers.add_parser("test", help="Run system diagnostics and health check")

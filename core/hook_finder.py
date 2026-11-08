@@ -287,9 +287,8 @@ class HookFinder:
         )
 
         user_prompt = (
-            f"Analyze the following lecture transcript and identify the top {num_clips} most engaging, "
-            f"viral, or high-value video clips. You may select both short viral moments (30s to 90s, aspect_ratio '9:16') "
-            f"and deep-dive standalone explanations (3 to 8 minutes, aspect_ratio '16:9'). "
+            f"Analyze the following lecture transcript and identify exactly {num_clips} of the top most engaging, "
+            f"viral, or high-value video clips. Each clip must have a duration between {self.min_duration:.0f}s and {self.max_duration:.0f}s. "
             f"Ensure each clip starts with an engaging 3-second hook and ends on a self-contained resolution.\n\n"
             f"LECTURE TRANSCRIPT:\n{formatted_transcript}"
         )
