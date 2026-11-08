@@ -29,6 +29,7 @@ from typing import Dict, List, Optional, Tuple
 
 from core.boundary_refiner import refine_clip_boundaries
 from core.captioner import CaptionRenderer, list_styles
+from core.export_ae import export_ae_project
 from core.health_check import run_diagnostics
 from core.hook_finder import (
     HookFinder,
@@ -988,6 +989,135 @@ def handle_clip(args: argparse.Namespace) -> None:
     )
 
 
+def handle_export(args: argparse.Namespace) -> None:
+    """Export After Effects ExtendScript JSX project, SRT, and markers CSV for a clip."""
+    input_path = Path(args.input).expanduser().resolve()
+    if not input_path.is_file():
+        sys.exit(f"[ERROR] Input video not found: {input_path}")
+
+    out_dir = Path(args.output_dir or "output/ae_export").expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Resolve Clip Metadata
+    clip_info: Optional[ViralClipMetadata] = None
+    if getattr(args, "start", None) is not None and getattr(args, "end", None) is not None:
+        start_t = float(args.start)
+        end_t = float(args.end)
+        if end_t <= start_t:
+            sys.exit(f"[ERROR] End time ({end_t}) must be greater than start time ({start_t}).")
+        dur = round(end_t - start_t, 2)
+        title = args.title or f"Custom Clip #{args.clip}"
+        slug = f"clip_{args.clip:02d}_{int(start_t)}s_{int(end_t)}s"
+        clip_info = ViralClipMetadata(
+            clip_id=args.clip,
+            title=title,
+            hook=title,
+            start_time=start_t,
+            end_time=end_t,
+            duration=dur,
+            viral_score=90,
+            reason="Manual selection",
+            slug=slug,
+            aspect_ratio="9:16",
+        )
+    else:
+        print(f"\n[export] Scanning lecture for viral hooks to locate clip #{args.clip}...")
+        finder = HookFinder(
+            whisper_model=args.whisper_full_model,
+            llm_model=args.llm_model,
+            api_key=args.api_key,
+            backend=getattr(args, "whisper_backend", "auto"),
+        )
+        num_clips = max(args.clip, 3)
+        clips = finder.find_viral_clips(input_path, num_clips=num_clips)
+        if not clips:
+            sys.exit("[ERROR] No highlight clips found in lecture transcript.")
+        if args.clip > len(clips):
+            sys.exit(f"[ERROR] Requested clip #{args.clip}, but only {len(clips)} clip(s) available.")
+        clip_info = clips[args.clip - 1]
+
+    print(f"\n[export] Target Clip #{clip_info.clip_id}: \"{clip_info.title}\" ({clip_info.duration:.1f}s)")
+    print(f"  • Time Range : {format_seconds_to_timestamp(clip_info.start_time)} -> {format_seconds_to_timestamp(clip_info.end_time)}")
+    print(f"  • Hook       : \"{clip_info.hook}\"")
+
+    # 2. Cut Audio-Synced Snippet (500ms delay baked in, CRF 10)
+    tag = f"9x16_{clip_info.clip_id:02d}_{clip_info.slug}"
+    snippet_path = out_dir / f"snippet_{tag}.mp4"
+    audio_delay_ms = float(getattr(args, "audio_delay", 500.0))
+
+    print(f"\n[export] [1/3] Cutting audio-synced snippet (audio_delay={audio_delay_ms:.0f}ms, crf=10)...")
+    cut_snippet_without_reencode(
+        input_path,
+        snippet_path,
+        clip_info.start_time,
+        clip_info.end_time,
+        audio_delay_ms=audio_delay_ms,
+        crf=10,
+    )
+
+    # 3. Compute Reframing Plan
+    print(f"\n[export] [2/3] Planning face-tracking trajectory (preset={args.reframe_preset}, detector={args.detector})...")
+    reframe_cfg = ReframeConfig(
+        src=snippet_path,
+        out=out_dir / f"reframed_{tag}.mp4",
+        preset=args.reframe_preset,
+        layout="direct-crop",
+        audio_delay_ms=0.0,
+        aspect_ratio="9:16",
+        detect_every=getattr(args, "detect_every", 3),
+        punch_in=getattr(args, "punch_in", "off"),
+        detector=getattr(args, "detector", "haar"),
+        model_path=getattr(args, "model_path", None),
+    )
+    reframer = FaceReframer(reframe_cfg)
+    plan = reframer.plan()
+
+    # 4. Transcribe and Romanize Words on Snippet
+    words = []
+    if not getattr(args, "no_caption", False):
+        print(f"\n[export] [3/3] Word-level Whisper STT & Hinglish transliteration...")
+        transcriber = HinglishTranscriber(
+            whisper_model=args.whisper_clip_model,
+            llm_model=args.llm_model,
+            api_key=args.api_key,
+            no_llm=getattr(args, "no_llm", False),
+            uppercase=True,
+            backend=getattr(args, "whisper_backend", "auto"),
+        )
+        words = transcriber.transcribe_and_romanize(
+            video_path=snippet_path,
+            src_lecture_video=input_path,
+            clip_start=clip_info.start_time,
+            clip_end=clip_info.end_time,
+            audio_delay_ms=audio_delay_ms,
+        )
+
+    # 5. Export After Effects Project
+    export_results = export_ae_project(
+        snippet_path=snippet_path,
+        plan=plan,
+        words=words,
+        out_dir=out_dir,
+        comp_name=f"Reel_{tag}",
+        caption_bottom_offset=getattr(args, "bottom_offset", 380),
+        target_rate=float(getattr(args, "target_rate", 7.0)),
+        copy_snippet=False,
+    )
+
+    print("\n" + "=" * 70)
+    print(" AFTER EFFECTS EXPORT SUCCESSFUL!")
+    print("=" * 70)
+    print(f"ExtendScript JSX : {export_results['jsx']}")
+    print(f"SubRip SRT       : {export_results['srt']}")
+    print(f"Timeline Markers : {export_results['csv']}")
+    print(f"Synced Footage   : {export_results['snippet']}")
+    print("\nTo import into After Effects:")
+    print("  1. Open Adobe After Effects")
+    print(f"  2. Choose File -> Scripts -> Run Script File...")
+    print(f"  3. Select: {export_results['jsx']}")
+    print("=" * 70 + "\n")
+
+
 def handle_reframe(args: argparse.Namespace) -> None:
     """Execute standalone reframing only."""
     src_path = Path(args.input).expanduser().resolve()
@@ -1270,6 +1400,29 @@ Examples:
     p_caption.add_argument("--whisper-backend", default="auto", choices=["auto", "openai", "mlx"], help="Whisper backend engine (default: auto, mlx if installed on Apple Silicon, else openai)")
     p_caption.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
 
+    # Command: 'export'
+    p_export = subparsers.add_parser("export", help="Export After Effects ExtendScript JSX project, SRT, and markers CSV for a clip")
+    p_export.add_argument("--input", "-i", default="samples/sample.mp4", help="Path to input lecture video (default: samples/sample.mp4)")
+    p_export.add_argument("--clip", "-n", type=int, default=1, help="Clip index to export (1-based, default: 1)")
+    p_export.add_argument("--output-dir", "-o", default="output/ae_export", help="Output directory for export files (default: output/ae_export)")
+    p_export.add_argument("--start", type=float, default=None, help="Optional manual start time in seconds")
+    p_export.add_argument("--end", type=float, default=None, help="Optional manual end time in seconds")
+    p_export.add_argument("--title", default=None, help="Optional manual clip title")
+    p_export.add_argument("--whisper-full-model", default="base", help="Whisper model for lecture scan (default: base)")
+    p_export.add_argument("--whisper-clip-model", default="large-v3", help="Whisper model for word sync on clip (default: large-v3)")
+    p_export.add_argument("--llm-model", default=os.getenv("HINGLISH_MODEL", "gemini-3.5-flash-lite"), help="Gemini model")
+    p_export.add_argument("--api-key", default=None, help="Gemini API key")
+    p_export.add_argument("--audio-delay", type=float, default=500.0, help="Audio delay offset in milliseconds to fix lip sync (default: 500.0)")
+    p_export.add_argument("--reframe-preset", default="talking_head", help="Reframing preset (default: talking_head)")
+    p_export.add_argument("--detector", default="haar", choices=["haar", "yunet", "vision"], help="Face detector (default: haar)")
+    p_export.add_argument("--detect-every", type=int, default=3, help="Face detection frame interval (default: 3)")
+    p_export.add_argument("--punch-in", default="off", choices=["off", "auto"], help="Punch-in zoom (default: off)")
+    p_export.add_argument("--whisper-backend", default="auto", choices=["auto", "openai", "mlx"], help="Whisper backend (default: auto)")
+    p_export.add_argument("--no-llm", action="store_true", help="Local rule-based transliteration only")
+    p_export.add_argument("--no-caption", action="store_true", help="Omit caption text layers in export")
+    p_export.add_argument("--bottom-offset", type=int, default=380, help="Caption bottom offset in pixels (default: 380)")
+    p_export.add_argument("--target-rate", type=float, default=7.0, help="Target keyframes per second for RDP simplification (default: 7.0)")
+
     # Command: 'test'
     p_test = subparsers.add_parser("test", help="Run system diagnostics and health check")
     p_test.add_argument("--llm-model", default=os.getenv("HINGLISH_MODEL", "gemini-3.5-flash-lite"), help="Model to verify")
@@ -1292,6 +1445,8 @@ def main() -> None:
         handle_detect(args)
     elif args.command == "clip":
         handle_clip(args)
+    elif args.command == "export":
+        handle_export(args)
     elif args.command == "reframe":
         handle_reframe(args)
     elif args.command == "caption":

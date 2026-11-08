@@ -52,6 +52,14 @@ from core.reframer import (
     reframe_video,
 )
 from core.render import render_reel
+from core.export_ae import (
+    export_ae_project,
+    simplify_keyframes,
+    generate_srt,
+    generate_markers_csv,
+    generate_extendscript_jsx,
+    validate_jsx_syntax,
+)
 from core.transcriber import (
     CACHE_DIR,
     DEV,
@@ -111,6 +119,12 @@ __all__ = [
     "ReframePlan",
     "compute_corner_drift",
     "render_reel",
+    "export_ae_project",
+    "simplify_keyframes",
+    "generate_srt",
+    "generate_markers_csv",
+    "generate_extendscript_jsx",
+    "validate_jsx_syntax",
     "REFRAME_PRESETS",
     "ReframeConfig",
     "find_cascade",
