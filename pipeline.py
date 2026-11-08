@@ -145,6 +145,8 @@ def prepare_clip(
     legacy_render: bool = False,
     detect_every: int = 3,
     punch_in: str = "off",
+    detector: str = "haar",
+    model_path: Optional[Path | str] = None,
 ) -> PreparedClip:
     """
     Prepare clip N: snippet cut, reframing plan, word timestamps, and romanization.
@@ -264,6 +266,8 @@ def prepare_clip(
                 aspect_ratio=target_aspect,
                 detect_every=detect_every,
                 punch_in=punch_in,
+                detector=detector,
+                model_path=model_path,
             )
             reframer = FaceReframer(reframe_cfg)
             reframer.run()
@@ -333,6 +337,8 @@ def prepare_clip(
                 detect_every=detect_every,
                 punch_in=punch_in,
                 words=words,
+                detector=detector,
+                model_path=model_path,
             )
             reframer = FaceReframer(reframe_cfg)
             plan = reframer.plan(words=words)
@@ -505,6 +511,8 @@ def process_single_clip(
     fast: bool = False,
     detect_every: int = 3,
     punch_in: str = "off",
+    detector: str = "haar",
+    model_path: Optional[Path | str] = None,
 ) -> Path:
     """Process a single clip through prepare + render."""
     prepared = prepare_clip(
@@ -531,6 +539,8 @@ def process_single_clip(
         legacy_render=legacy_render,
         detect_every=detect_every,
         punch_in=punch_in,
+        detector=detector,
+        model_path=model_path,
     )
     return render_prepared_clip(
         prepared=prepared,
@@ -567,6 +577,8 @@ def process_clips_pipelined(
     fast: bool = False,
     detect_every: int = 3,
     punch_in: str = "off",
+    detector: str = "haar",
+    model_path: Optional[Path | str] = None,
 ) -> Tuple[List[Path], List[dict]]:
     """
     Process multiple clips with pipelined preparation:
@@ -604,6 +616,8 @@ def process_clips_pipelined(
             legacy_render=legacy_render,
             detect_every=detect_every,
             punch_in=punch_in,
+            detector=detector,
+            model_path=model_path,
         )
 
     # Use ThreadPoolExecutor(max_workers=1) to pipeline preparation of clip N+1 while clip N renders
@@ -653,6 +667,7 @@ def handle_run(args: argparse.Namespace) -> None:
     print(f"• Target Aspect   : {args.aspect} (<180s -> 9:16 vertical, >=180s -> 16:9 widescreen)")
     print(f"• Captions        : {'Disabled (--no-caption)' if args.no_caption else f'Enabled ({args.style})'}")
     print(f"• Whisper Backend : {getattr(args, 'whisper_backend', 'auto')}")
+    print(f"• Face Detector   : {getattr(args, 'detector', 'haar')}")
     print(f"• Full Scan Model : Whisper '{args.whisper_full_model}' (Cached)")
     print(f"• Word Sync Model : Whisper '{args.whisper_clip_model}'")
     print(f"• AI Brain        : {args.llm_model}")
@@ -714,6 +729,8 @@ def handle_run(args: argparse.Namespace) -> None:
         fast=getattr(args, "fast", False),
         detect_every=getattr(args, "detect_every", 3),
         punch_in=getattr(args, "punch_in", "off"),
+        detector=getattr(args, "detector", "haar"),
+        model_path=getattr(args, "model_path", None),
     )
 
     # 3. Export Social Media Metadata JSON
@@ -892,6 +909,8 @@ def handle_interactive(args: argparse.Namespace, existing_clips: Optional[List[V
         fast=getattr(args, "fast", False),
         detect_every=getattr(args, "detect_every", 3),
         punch_in=getattr(args, "punch_in", "off"),
+        detector=getattr(args, "detector", "haar"),
+        model_path=getattr(args, "model_path", None),
     )
 
     print("\n" + "=" * 70)
@@ -964,6 +983,8 @@ def handle_clip(args: argparse.Namespace) -> None:
         fast=getattr(args, "fast", False),
         detect_every=getattr(args, "detect_every", 3),
         punch_in=getattr(args, "punch_in", "off"),
+        detector=getattr(args, "detector", "haar"),
+        model_path=getattr(args, "model_path", None),
     )
 
 
@@ -998,6 +1019,8 @@ def handle_reframe(args: argparse.Namespace) -> None:
         detect_every=getattr(args, "detect_every", 3),
         detect_width=getattr(args, "detect_width", 320),
         punch_in=getattr(args, "punch_in", "off"),
+        detector=getattr(args, "detector", "haar"),
+        model_path=getattr(args, "model_path", None),
     )
     reframer = FaceReframer(reframe_cfg)
     reframer.run(fast=getattr(args, "fast", False))
@@ -1109,6 +1132,8 @@ Examples:
     p_run.add_argument("--detect-every", type=int, default=3, help="Run face detection every Nth frame with template tracking in between (default: 3)")
     p_run.add_argument("--filter-face-presence", action="store_true", help="Filter vertical clips where teacher face is visible in < 70%% of frames")
     p_run.add_argument("--punch-in", default="off", choices=["off", "auto"], help="Dynamic punch-in zoom on emphasis moments & RMS energy peaks (default: off)")
+    p_run.add_argument("--detector", default="haar", choices=["haar", "yunet", "vision"], help="Face detector backend: haar (default), yunet (ONNX neural net), or vision (Apple Vision framework)")
+    p_run.add_argument("--model-path", default=None, help="Custom path to YuNet ONNX model (face_detection_yunet_2023mar.onnx)")
 
     # Command: 'interactive'
     p_inter = subparsers.add_parser("interactive", help="Interactive clip and aspect ratio selection with boundary re-verification")
@@ -1137,6 +1162,8 @@ Examples:
     p_inter.add_argument("--detect-every", type=int, default=3, help="Run face detection every Nth frame with template tracking in between (default: 3)")
     p_inter.add_argument("--filter-face-presence", action="store_true", help="Filter vertical clips where teacher face is visible in < 70%% of frames")
     p_inter.add_argument("--punch-in", default="off", choices=["off", "auto"], help="Dynamic punch-in zoom on emphasis moments & RMS energy peaks (default: off)")
+    p_inter.add_argument("--detector", default="haar", choices=["haar", "yunet", "vision"], help="Face detector backend: haar (default), yunet (ONNX neural net), or vision (Apple Vision framework)")
+    p_inter.add_argument("--model-path", default=None, help="Custom path to YuNet ONNX model (face_detection_yunet_2023mar.onnx)")
 
     # Command: 'detect'
     p_detect = subparsers.add_parser("detect", help="Detect viral moments & hooks without rendering video")
@@ -1162,6 +1189,8 @@ Examples:
     p_detect.add_argument("--no-caption", action="store_true", help="Bypass caption burning")
     p_detect.add_argument("--whisper-backend", default="auto", choices=["auto", "openai", "mlx"], help="Whisper backend engine (default: auto, mlx if installed on Apple Silicon, else openai)")
     p_detect.add_argument("--filter-face-presence", action="store_true", help="Filter vertical clips where teacher face is visible in < 70%% of frames")
+    p_detect.add_argument("--detector", default="haar", choices=["haar", "yunet", "vision"], help="Face detector backend: haar (default), yunet (ONNX neural net), or vision (Apple Vision framework)")
+    p_detect.add_argument("--model-path", default=None, help="Custom path to YuNet ONNX model (face_detection_yunet_2023mar.onnx)")
 
     # Command: 'clip'
     p_clip = subparsers.add_parser("clip", help="Render a specific manual time window end-to-end")
@@ -1193,6 +1222,8 @@ Examples:
     p_clip.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
     p_clip.add_argument("--detect-every", type=int, default=3, help="Run face detection every Nth frame with template tracking in between (default: 3)")
     p_clip.add_argument("--punch-in", default="off", choices=["off", "auto"], help="Dynamic punch-in zoom on emphasis moments & RMS energy peaks (default: off)")
+    p_clip.add_argument("--detector", default="haar", choices=["haar", "yunet", "vision"], help="Face detector backend: haar (default), yunet (ONNX neural net), or vision (Apple Vision framework)")
+    p_clip.add_argument("--model-path", default=None, help="Custom path to YuNet ONNX model (face_detection_yunet_2023mar.onnx)")
 
     # Command: 'reframe'
     p_reframe = subparsers.add_parser("reframe", help="Standalone face-tracking 9:16 vertical crop")
@@ -1215,6 +1246,8 @@ Examples:
     p_reframe.add_argument("--detect-every", type=int, default=3, help="Run face detection every Nth frame with template tracking in between (default: 3)")
     p_reframe.add_argument("--detect-width", type=int, default=320, help="Downscale width for face detection (default: 320)")
     p_reframe.add_argument("--punch-in", default="off", choices=["off", "auto"], help="Dynamic punch-in zoom on emphasis moments & RMS energy peaks (default: off)")
+    p_reframe.add_argument("--detector", default="haar", choices=["haar", "yunet", "vision"], help="Face detector backend: haar (default), yunet (ONNX neural net), or vision (Apple Vision framework)")
+    p_reframe.add_argument("--model-path", default=None, help="Custom path to YuNet ONNX model (face_detection_yunet_2023mar.onnx)")
 
     # Command: 'caption'
     p_caption = subparsers.add_parser("caption", help="Standalone word-by-word captions on vertical video")

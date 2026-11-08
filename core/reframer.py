@@ -43,6 +43,21 @@ except ImportError:
     except ImportError:
         AudioFeatureExtractor = None
 
+try:
+    from scripts.download_models import ensure_yunet_model
+except ImportError:
+    try:
+        from download_models import ensure_yunet_model
+    except ImportError:
+        ensure_yunet_model = None
+
+try:
+    import Vision
+    import Foundation
+    _VISION_AVAILABLE = True
+except Exception:
+    _VISION_AVAILABLE = False
+
 
 # ── Presets Catalog ──────────────────────────────────────────────────────────────────
 
@@ -125,6 +140,10 @@ class ReframePlan:
     crop_w_arr: Optional[np.ndarray] = None
     crop_h_arr: Optional[np.ndarray] = None
     zoom_curve: Optional[np.ndarray] = None
+    detector: str = "haar"
+    face_lock_count: int = 0
+    motion_fallback_count: int = 0
+    hold_count: int = 0
 
 
 @dataclass
@@ -156,6 +175,8 @@ class ReframeConfig:
     punch_in: str = "off"
     punch_in_events: Optional[List[Tuple[float, float]]] = None
     words: Optional[List] = None
+    detector: str = "haar"
+    model_path: Optional[Path | str] = None
 
 
 def find_cascade(custom_path: Optional[Path | str] = None) -> Path:
@@ -190,6 +211,244 @@ def find_cascade(custom_path: Optional[Path | str] = None) -> Path:
         f"Cascade classifier '{cascade_filename}' not found. Please provide --cascade "
         f"or place '{cascade_filename}' in current directory or user home ({home})."
     )
+
+
+# ── Pluggable Face Detectors ──────────────────────────────────────────────────────────
+
+class BaseFaceDetector:
+    """Base interface for pluggable vertical reframer face detectors."""
+    name: str = "base"
+
+    def detect(self, frame: np.ndarray, gray: np.ndarray) -> List[Tuple[int, int, int, int, float, float]]:
+        """
+        Detect face bounding boxes in frame.
+        Returns list of (x, y, w, h, cx, cy) in original frame pixel coordinates.
+        """
+        raise NotImplementedError
+
+
+class HaarFaceDetector(BaseFaceDetector):
+    """OpenCV Haar Cascade Face Detector (CPU-based, robust baseline)."""
+    name: str = "haar"
+
+    def __init__(self, cascade_path: Path | str, detect_width: int = 320) -> None:
+        self.cascade_path = Path(cascade_path).expanduser().resolve()
+        self.face_cascade = cv2.CascadeClassifier(str(self.cascade_path))
+        if self.face_cascade.empty():
+            raise RuntimeError(f"Failed to load OpenCV cascade from: {self.cascade_path}")
+        self.detect_width = detect_width
+
+    def detect(self, frame: np.ndarray, gray: np.ndarray) -> List[Tuple[int, int, int, int, float, float]]:
+        height, width = frame.shape[:2]
+        if width > self.detect_width:
+            scale = self.detect_width / width
+            det_w = self.detect_width
+            det_h = max(1, int(round(height * scale)))
+            inv_scale_x = width / det_w
+            inv_scale_y = height / det_h
+            min_size = max(24, int(round(32 * scale)))
+            det_gray = cv2.resize(gray, (det_w, det_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            det_gray = gray
+            inv_scale_x, inv_scale_y = 1.0, 1.0
+            min_size = 32
+
+        faces = self.face_cascade.detectMultiScale(
+            det_gray,
+            scaleFactor=1.08,
+            minNeighbors=4,
+            minSize=(min_size, min_size)
+        )
+        boxes: List[Tuple[int, int, int, int, float, float]] = []
+        for (sx, sy, sw, sh) in (faces if len(faces) else []):
+            x = int(round(sx * inv_scale_x))
+            y = int(round(sy * inv_scale_y))
+            w = int(round(sw * inv_scale_x))
+            h = int(round(sh * inv_scale_y))
+            cx = x + w / 2.0
+            cy = y + h / 2.0
+            boxes.append((x, y, w, h, cx, cy))
+        return boxes
+
+
+class YuNetFaceDetector(BaseFaceDetector):
+    """OpenCV YuNet ONNX Face Detector (neural network, high recall & fast)."""
+    name: str = "yunet"
+
+    def __init__(
+        self,
+        model_path: Optional[Path | str] = None,
+        detect_width: int = 320,
+        score_threshold: float = 0.6
+    ) -> None:
+        self.detect_width = detect_width
+        self.score_threshold = score_threshold
+
+        resolved_path: Optional[Path] = None
+        if model_path is not None:
+            candidate = Path(model_path).expanduser().resolve()
+            if candidate.is_file():
+                resolved_path = candidate
+            else:
+                raise FileNotFoundError(f"YuNet model file not found at specified path: {model_path}")
+
+        if resolved_path is None:
+            # Check local models directories
+            candidates = [
+                Path(__file__).resolve().parent.parent / "models" / "face_detection_yunet_2023mar.onnx",
+                Path.cwd() / "models" / "face_detection_yunet_2023mar.onnx",
+                Path.cwd() / "core" / "face_detection_yunet_2023mar.onnx",
+                Path.home() / ".cache" / "models" / "face_detection_yunet_2023mar.onnx",
+            ]
+            for c in candidates:
+                if c.is_file() and c.stat().st_size > 100000:
+                    resolved_path = c
+                    break
+
+        if resolved_path is None and ensure_yunet_model is not None:
+            try:
+                resolved_path = ensure_yunet_model()
+            except Exception as exc:
+                print(f"[reframe] Warning: Failed to auto-download YuNet model: {exc}")
+
+        if resolved_path is None or not resolved_path.is_file():
+            raise FileNotFoundError(
+                "YuNet ONNX model not found. Run 'python3 scripts/download_models.py' or specify --model-path."
+            )
+
+        self.model_path = resolved_path
+        self.detector = cv2.FaceDetectorYN.create(
+            str(self.model_path),
+            "",
+            (320, 320),
+            score_threshold=self.score_threshold,
+            nms_threshold=0.3,
+            top_k=5000,
+        )
+        if self.detector is None:
+            raise RuntimeError(f"Failed to initialize cv2.FaceDetectorYN with model: {self.model_path}")
+        self._cur_input_size = (320, 320)
+
+    def detect(self, frame: np.ndarray, gray: np.ndarray) -> List[Tuple[int, int, int, int, float, float]]:
+        height, width = frame.shape[:2]
+        if width > self.detect_width:
+            scale = self.detect_width / width
+            det_w = self.detect_width
+            det_h = max(1, int(round(height * scale)))
+            inv_scale_x = width / det_w
+            inv_scale_y = height / det_h
+            det_frame = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            det_frame = frame
+            det_w, det_h = width, height
+            inv_scale_x, inv_scale_y = 1.0, 1.0
+
+        if (det_w, det_h) != self._cur_input_size:
+            self.detector.setInputSize((det_w, det_h))
+            self._cur_input_size = (det_w, det_h)
+
+        _, detections = self.detector.detect(det_frame)
+        boxes: List[Tuple[int, int, int, int, float, float]] = []
+        if detections is not None:
+            for face in detections:
+                fx, fy, fw, fh = face[:4]
+                x = int(round(fx * inv_scale_x))
+                y = int(round(fy * inv_scale_y))
+                w = int(round(fw * inv_scale_x))
+                h = int(round(fh * inv_scale_y))
+                cx = x + w / 2.0
+                cy = y + h / 2.0
+                boxes.append((x, y, w, h, cx, cy))
+        return boxes
+
+
+class VisionFaceDetector(BaseFaceDetector):
+    """Apple Vision framework Face Detector via PyObjC."""
+    name: str = "vision"
+
+    def __init__(self, detect_width: int = 320) -> None:
+        self.detect_width = detect_width
+        if not _VISION_AVAILABLE:
+            raise RuntimeError(
+                "Apple Vision framework via PyObjC is not available. "
+                "Ensure pyobjc-framework-Vision is installed or use --detector haar."
+            )
+        import Vision  # type: ignore
+        import Foundation  # type: ignore
+        self._Vision = Vision
+        self._Foundation = Foundation
+        self._face_req = Vision.VNDetectFaceRectanglesRequest.alloc().init()
+
+    def detect(self, frame: np.ndarray, gray: np.ndarray) -> List[Tuple[int, int, int, int, float, float]]:
+        height, width = frame.shape[:2]
+        if width > self.detect_width:
+            scale = self.detect_width / width
+            det_w = self.detect_width
+            det_h = max(1, int(round(height * scale)))
+            det_frame = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            det_frame = frame
+
+        ok, buf = cv2.imencode(".jpg", det_frame)
+        if not ok:
+            return []
+
+        raw_bytes = buf.tobytes()
+        nsdata = self._Foundation.NSData.dataWithBytes_length_(raw_bytes, len(raw_bytes))
+        handler = self._Vision.VNImageRequestHandler.alloc().initWithData_options_(nsdata, None)
+        success, _ = handler.performRequests_error_([self._face_req], None)
+        if not success:
+            return []
+
+        results = self._face_req.results() or []
+        boxes: List[Tuple[int, int, int, int, float, float]] = []
+        for face in results:
+            bb = face.boundingBox()
+            x = int(round(bb.origin.x * width))
+            y = int(round((1.0 - bb.origin.y - bb.size.height) * height))
+            w = int(round(bb.size.width * width))
+            h = int(round(bb.size.height * height))
+            cx = x + w / 2.0
+            cy = y + h / 2.0
+            boxes.append((x, y, w, h, cx, cy))
+        return boxes
+
+
+def create_face_detector(
+    detector_type: str = "haar",
+    cascade_path: Optional[Path | str] = None,
+    model_path: Optional[Path | str] = None,
+    detect_width: int = 320,
+) -> BaseFaceDetector:
+    """
+    Factory function for pluggable vertical reframing face detectors:
+    - 'haar'   : OpenCV Haar Cascade (default)
+    - 'yunet'  : OpenCV YuNet ONNX
+    - 'vision' : Apple Vision framework via PyObjC
+    Falls back gracefully to Haar if the requested detector cannot be initialized.
+    """
+    det_lower = (detector_type or "haar").strip().lower()
+
+    if det_lower == "yunet":
+        try:
+            return YuNetFaceDetector(model_path=model_path, detect_width=detect_width)
+        except Exception as exc:
+            print(f"[reframe] WARNING: YuNet detector failed to initialize ({exc}). Falling back to Haar cascade.")
+            cascade_file = find_cascade(cascade_path)
+            return HaarFaceDetector(cascade_file, detect_width=detect_width)
+
+    elif det_lower == "vision":
+        try:
+            return VisionFaceDetector(detect_width=detect_width)
+        except Exception as exc:
+            print(f"[reframe] WARNING: Vision detector unavailable ({exc}). Falling back to Haar cascade.")
+            cascade_file = find_cascade(cascade_path)
+            return HaarFaceDetector(cascade_file, detect_width=detect_width)
+
+    else:
+        # Default: haar
+        cascade_file = find_cascade(cascade_path)
+        return HaarFaceDetector(cascade_file, detect_width=detect_width)
 
 
 def compute_motion_ratio(mask: np.ndarray, x: int, y: int, w: int, h: int, frame_w: int, frame_h: int) -> float:
@@ -557,9 +816,10 @@ class FaceReframer:
     def __init__(self, config: ReframeConfig) -> None:
         self.config = config
         self.cascade_file = find_cascade(config.cascade_path)
-        self.face_cascade = cv2.CascadeClassifier(str(self.cascade_file))
-        if self.face_cascade.empty():
-            raise RuntimeError(f"Failed to load OpenCV cascade from: {self.cascade_file}")
+        try:
+            self.face_cascade = cv2.CascadeClassifier(str(self.cascade_file))
+        except Exception:
+            self.face_cascade = None
 
         # Resolve preset
         raw_preset = (config.preset or "talking_head").strip().lower().replace("-", "_")
@@ -596,6 +856,17 @@ class FaceReframer:
         self.detect_every = max(1, getattr(config, "detect_every", 3))
         self.detect_width = max(160, getattr(config, "detect_width", 320))
         self.punch_in = getattr(config, "punch_in", "off")
+
+        # Initialize pluggable detector (haar | yunet | vision)
+        self.detector_name = getattr(config, "detector", "haar")
+        self.model_path = getattr(config, "model_path", None)
+        self.detector = create_face_detector(
+            detector_type=self.detector_name,
+            cascade_path=self.cascade_file,
+            model_path=self.model_path,
+            detect_width=self.detect_width,
+        )
+
         self.time_pass1: float = 0.0
         self.time_render: float = 0.0
         self.stage_timings: Dict[str, float] = {
@@ -673,29 +944,15 @@ class FaceReframer:
         print(f"[reframe] Crop: {crop_w}x{crop_h} (Zoom: {zoom:.2f}x, Deadzone: {self.deadzone_px}px, Headroom: {self.headroom*100:.0f}%, Target: {out_canvas_w}x{out_canvas_h})")
 
         # ---------------- PASS 1: Face Detection + Motion + Scene Cut Detection ----------------
-        print("[reframe] Pass 1/2: Scanning frames for faces, motion, and scene cuts...")
+        print(f"[reframe] Pass 1/2: Scanning frames for faces (detector: {self.detector.name}), motion, and scene cuts...")
         detections: List[List[Tuple[float, float, int, int, float]]] = []
+        motion_blobs: List[List[Tuple[float, float, float]]] = []
         frame_buffer: List[np.ndarray] = []
         scene_cuts: List[int] = [0]
         prev_hist: Optional[np.ndarray] = None
         min_scene_frames = max(15, int(fps * 0.6))
         last_cut_idx = 0
         frame_idx = 0
-
-        # Setup downscaled Haar detection geometry (~320 px wide, default N=3, no full-res equalizeHist)
-        det_target_w = self.detect_width
-        if width > det_target_w:
-            det_scale = det_target_w / width
-            det_w = det_target_w
-            det_h = max(1, int(round(height * det_scale)))
-            inv_scale_x = width / det_w
-            inv_scale_y = height / det_h
-            min_size_scaled = max(24, int(round(32 * det_scale)))
-        else:
-            det_scale = 1.0
-            det_w, det_h = width, height
-            inv_scale_x, inv_scale_y = 1.0, 1.0
-            min_size_scaled = 32
 
         detect_every = self.detect_every
 
@@ -728,32 +985,35 @@ class FaceReframer:
             prev_hist = hist
 
             ref_frame = frame_buffer[max(0, len(frame_buffer) - 1 - lag)]
-            motion_mask = (cv2.absdiff(blur, ref_frame) > pixel_threshold).astype(np.float32)
+            diff = cv2.absdiff(blur, ref_frame)
+            motion_mask = (diff > pixel_threshold).astype(np.float32)
+
+            # Extract motion contours for back-turned fallback
+            motion_uint8 = (diff > pixel_threshold).astype(np.uint8) * 255
+            contours, _ = cv2.findContours(motion_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            frame_motion_blobs: List[Tuple[float, float, float]] = []
+            for cnt in contours:
+                area = float(cv2.contourArea(cnt))
+                if area >= 120.0:
+                    M = cv2.moments(cnt)
+                    if M["m00"] > 0:
+                        mcx = float(M["m10"] / M["m00"])
+                        mcy = float(M["m01"] / M["m00"])
+                        frame_motion_blobs.append((mcx, mcy, area))
+            motion_blobs.append(frame_motion_blobs)
 
             valid_face_boxes: List[Tuple[int, int, int, int, float, float]] = []
 
-            # 1. Run Haar detection on downscaled gray frame every Nth frame (or if face tracking lost)
-            run_haar = (detect_every <= 1) or ((frame_idx - 1) % detect_every == 0) or (prev_template is None)
-            if run_haar:
-                det_gray = cv2.resize(gray, (det_w, det_h), interpolation=cv2.INTER_LINEAR) if det_scale < 1.0 else gray
-                faces = self.face_cascade.detectMultiScale(
-                    det_gray,
-                    scaleFactor=1.08,
-                    minNeighbors=4,
-                    minSize=(min_size_scaled, min_size_scaled)
-                )
-                for (sx, sy, sw, sh) in (faces if len(faces) else []):
-                    x = int(round(sx * inv_scale_x))
-                    y = int(round(sy * inv_scale_y))
-                    w = int(round(sw * inv_scale_x))
-                    h = int(round(sh * inv_scale_y))
-                    cx = x + w / 2.0
-                    cy = y + h / 2.0
+            # 1. Run face detector every Nth frame (or if face tracking lost)
+            run_detector = (detect_every <= 1) or ((frame_idx - 1) % detect_every == 0) or (prev_template is None)
+            if run_detector:
+                raw_boxes = self.detector.detect(frame, gray)
+                for (x, y, w, h, cx, cy) in raw_boxes:
                     if cx > width * self.config.roi_xmax:
                         continue
                     valid_face_boxes.append((x, y, w, h, cx, cy))
 
-            # 2. Fast template tracking assist when Haar wasn't run or temporarily misses
+            # 2. Fast template tracking assist when detector wasn't run or temporarily misses
             if not valid_face_boxes and prev_template is not None and prev_box is not None:
                 bx, by, bw, bh = prev_box
                 sx0 = max(0, bx - 60)
@@ -832,12 +1092,15 @@ class FaceReframer:
         def is_static_detection(cx: float, cy: float) -> bool:
             return any(np.hypot(cx - sc[0], cy - sc[1]) < 35.0 for sc in static_centers)
 
-        # ---------------- PASS 2: Teacher Locking with Cut-Aware Reset ----------------
+        # ---------------- PASS 2: Teacher Locking with Back-Turned Fallback & Cut-Aware Reset ----------------
         raw_x = np.full(num_frames, np.nan)
         raw_y = np.full(num_frames, np.nan)
         prev_target: Optional[Tuple[float, float]] = None
         consecutive_misses = 0
         cut_indices = set(scene_cuts)
+        face_lock_count = 0
+        motion_fallback_count = 0
+        hold_count = 0
 
         for t, frame_dets in enumerate(detections):
             # Immediate target reset at scene cuts to prevent slow cross-cut drifting
@@ -846,32 +1109,62 @@ class FaceReframer:
                 consecutive_misses = 0
 
             candidates = [d for d in frame_dets if not is_static_detection(d[0], d[1])]
-            if not candidates:
+            best_face = None
+            if candidates:
+                if prev_target is None:
+                    # Rank candidates by motion + area score
+                    best_face = max(candidates, key=lambda d: d[4] + 0.00005 * d[2] * d[3])
+                else:
+                    gate = 90.0 + 8.0 * min(consecutive_misses, 15)
+                    nearby = [d for d in candidates if np.hypot(d[0] - prev_target[0], d[1] - prev_target[1]) < gate]
+                    if nearby:
+                        best_face = min(nearby, key=lambda d: np.hypot(d[0] - prev_target[0], d[1] - prev_target[1]))
+
+            if best_face is not None:
+                prev_target = (best_face[0], best_face[1])
+                consecutive_misses = 0
+                raw_x[t] = best_face[0]
+                # Eyeline sits slightly above face center (~40% from top of face box)
+                raw_y[t] = best_face[1] - 0.10 * best_face[3]
+                face_lock_count += 1
+            else:
                 consecutive_misses += 1
+                if prev_target is not None:
+                    if consecutive_misses >= 3:
+                        # Back-turned fallback: search for motion-mask centroid near last known position
+                        motion_gate = 140.0 + 10.0 * min(consecutive_misses, 15)
+                        frame_motion = motion_blobs[t] if t < len(motion_blobs) else []
+                        nearby_motion = [
+                            m for m in frame_motion
+                            if np.hypot(m[0] - prev_target[0], m[1] - prev_target[1]) < motion_gate
+                        ]
+                        if nearby_motion:
+                            # Pick prominent motion blob near previous position
+                            best_mot = max(
+                                nearby_motion,
+                                key=lambda m: m[2] / (1.0 + 0.05 * np.hypot(m[0] - prev_target[0], m[1] - prev_target[1]))
+                            )
+                            raw_x[t] = best_mot[0]
+                            raw_y[t] = prev_target[1]
+                            prev_target = (0.75 * prev_target[0] + 0.25 * best_mot[0], prev_target[1])
+                            motion_fallback_count += 1
+                        else:
+                            # If motion also fails: HOLD position
+                            raw_x[t] = prev_target[0]
+                            raw_y[t] = prev_target[1]
+                            hold_count += 1
+                    else:
+                        # Transient miss (< 3 frames): HOLD position
+                        raw_x[t] = prev_target[0]
+                        raw_y[t] = prev_target[1]
+                        hold_count += 1
+
                 if consecutive_misses > 75:
                     prev_target = None
-                continue
-
-            if prev_target is None:
-                # Rank candidates by motion + area score
-                best = max(candidates, key=lambda d: d[4] + 0.00005 * d[2] * d[3])
-            else:
-                gate = 90.0 + 8.0 * consecutive_misses
-                nearby = [d for d in candidates if np.hypot(d[0] - prev_target[0], d[1] - prev_target[1]) < gate]
-                if not nearby:
-                    consecutive_misses += 1
-                    continue
-                best = min(nearby, key=lambda d: np.hypot(d[0] - prev_target[0], d[1] - prev_target[1]))
-
-            prev_target = (best[0], best[1])
-            consecutive_misses = 0
-            raw_x[t] = best[0]
-            # Eyeline sits slightly above face center (~40% from top of face box)
-            raw_y[t] = best[1] - 0.10 * best[3]
 
         valid_mask = ~np.isnan(raw_x)
         num_valid = int(valid_mask.sum())
-        lock_pct = 100.0 * num_valid / num_frames if num_frames > 0 else 0.0
+        face_lock_pct = 100.0 * face_lock_count / num_frames if num_frames > 0 else 0.0
         all_indices = np.arange(num_frames)
 
         if num_valid == 0:
@@ -879,7 +1172,10 @@ class FaceReframer:
             interpolated_cx = np.full(num_frames, width / 2.0)
             interpolated_cy = np.full(num_frames, height / 3.0)
         else:
-            print(f"[reframe] Pass 2: Face locked in {num_valid}/{num_frames} frames ({lock_pct:.1f}%)")
+            print(
+                f"[reframe] Pass 2: Face locked in {face_lock_count}/{num_frames} frames ({face_lock_pct:.1f}%), "
+                f"motion fallback: {motion_fallback_count}, hold: {hold_count}"
+            )
             interpolated_cx = np.interp(all_indices, all_indices[valid_mask], raw_x[valid_mask])
             interpolated_cy = np.interp(all_indices, all_indices[valid_mask], raw_y[valid_mask])
 
@@ -994,12 +1290,16 @@ class FaceReframer:
             audio_bitrate=self.config.audio_bitrate,
             detections=detections,
             static_centers=static_centers,
-            lock_pct=lock_pct,
-            num_valid_faces=num_valid,
+            lock_pct=face_lock_pct,
+            num_valid_faces=face_lock_count,
             detect_every=detect_every,
             crop_w_arr=crop_w_arr,
             crop_h_arr=crop_h_arr,
             zoom_curve=total_zoom_arr,
+            detector=self.detector.name,
+            face_lock_count=face_lock_count,
+            motion_fallback_count=motion_fallback_count,
+            hold_count=hold_count,
         )
 
     def render(self, plan: Optional[ReframePlan] = None, fast: bool = False) -> Path:
@@ -1203,6 +1503,8 @@ def reframe_video(
     detect_every: int = 3,
     detect_width: int = 320,
     punch_in: str = "off",
+    detector: str = "haar",
+    model_path: Optional[Path | str] = None,
 ) -> Path:
     """Convenience functional interface for video reframing."""
     config = ReframeConfig(
@@ -1226,6 +1528,8 @@ def reframe_video(
         detect_every=detect_every,
         detect_width=detect_width,
         punch_in=punch_in,
+        detector=detector,
+        model_path=model_path,
     )
     reframer = FaceReframer(config)
     return reframer.run(fast=fast)
@@ -1250,6 +1554,8 @@ if __name__ == "__main__":
     parser.add_argument("--roi-xmax", type=float, default=1.0, help="Ignore face detections to the right of this fraction")
     parser.add_argument("--detect-every", type=int, default=3, help="Run face detection every Nth frame with template tracking in between (default: 3)")
     parser.add_argument("--detect-width", type=int, default=320, help="Downscale width for face detection (default: 320)")
+    parser.add_argument("--detector", default="haar", choices=["haar", "yunet", "vision"], help="Face detector backend: haar (default), yunet (ONNX neural net), or vision (Apple Vision framework)")
+    parser.add_argument("--model-path", default=None, help="Custom path to YuNet ONNX model (face_detection_yunet_2023mar.onnx)")
     parser.add_argument("--debug", action="store_true", help="Generate debug video with bounding box overlays")
     parser.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M)")
     args = parser.parse_args()
@@ -1271,5 +1577,7 @@ if __name__ == "__main__":
         zoom=args.zoom,
         headroom=args.headroom,
         layout=args.layout,
-        audio_delay_ms=args.audio_delay
+        audio_delay_ms=args.audio_delay,
+        detector=args.detector,
+        model_path=args.model_path,
     )
