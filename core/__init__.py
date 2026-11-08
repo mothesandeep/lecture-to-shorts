@@ -30,10 +30,12 @@ from core.reframer import (
     REFRAME_PRESETS,
     FaceReframer,
     ReframeConfig,
+    ReframePlan,
     find_cascade,
     list_reframe_presets,
     reframe_video,
 )
+from core.render import render_reel
 from core.transcriber import (
     CACHE_DIR,
     DEV,
@@ -77,6 +79,8 @@ __all__ = [
     "extract_audio",
     "format_seconds_to_timestamp",
     "FaceReframer",
+    "ReframePlan",
+    "render_reel",
     "REFRAME_PRESETS",
     "ReframeConfig",
     "find_cascade",

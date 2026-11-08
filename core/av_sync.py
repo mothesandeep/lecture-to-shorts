@@ -127,7 +127,8 @@ def cut_snippet_accurate(
     start_time: float,
     end_time: float,
     target_fps: Optional[float] = None,
-    audio_delay_ms: float = 500.0
+    audio_delay_ms: float = 500.0,
+    crf: int = 10,
 ) -> Path:
     """
     Accurately cuts time snippet from source video with strict audio-video lip-sync:
@@ -170,7 +171,7 @@ def cut_snippet_accurate(
         "-fps_mode", "cfr",
         "-c:v", "libx264",
         "-preset", "ultrafast",
-        "-crf", "18",
+        "-crf", str(crf),
         "-c:a", "aac",
         "-b:a", "192k",
         "-shortest",
@@ -251,7 +252,7 @@ def ensure_cfr_video(
         "-fps_mode", "cfr",
         "-c:v", "libx264",
         "-preset", "ultrafast",
-        "-crf", "18",
+        "-crf", str(crf),
         "-c:a", "aac",
         "-b:a", "192k",
     ]

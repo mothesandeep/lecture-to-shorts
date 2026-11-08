@@ -29,7 +29,7 @@ import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -546,6 +546,279 @@ class CaptionRenderer:
                     break
             chunk.meta = best_meta
 
+    def create_composer(
+        self,
+        words: List[WordCaption],
+        width: int,
+        height: int,
+    ) -> Callable[[np.ndarray, float], np.ndarray]:
+        """
+        Create a per-frame caption compositor callable.
+        Takes (frame: np.ndarray [BGR], current_time: float) -> np.ndarray [BGR].
+        Precomputes chunks and layouts so per-frame drawing is fast.
+        """
+        chunks = self.build_chunks(words)
+        self.calculate_layouts(chunks, width, height)
+
+        is_widescreen = (width > height)
+        if is_widescreen:
+            if self.bottom_offset == 380:
+                effective_bottom_offset = min(120, max(45, int(height * 0.11)))
+            else:
+                effective_bottom_offset = self.bottom_offset
+        elif height <= 1450 and width < height:
+            if self.bottom_offset == 380:
+                effective_bottom_offset = int(height * 0.18)
+            else:
+                effective_bottom_offset = self.bottom_offset
+        else:
+            effective_bottom_offset = self.bottom_offset
+
+        y_pos = max(30, height - effective_bottom_offset + self.style.bottom_offset_adjust)
+
+        needs_alpha = (
+            self.style.chunk_bg
+            or self.style.active_box_highlight
+            or self.style.shadow_offset is not None
+            or self.style.future_alpha < 255
+            or self.style.chunk_fade_in
+            or self.style.glow
+            or self.style.shadow_3d
+        )
+
+        def compose(frame: np.ndarray, current_time: float) -> np.ndarray:
+            if not chunks:
+                return frame
+
+            # Locate active chunk for current timestamp
+            active_chunk: Optional[CaptionChunk] = None
+            active_word_idx = -1
+
+            for chunk in chunks:
+                if chunk.start <= current_time <= chunk.end + 0.20:
+                    active_chunk = chunk
+                    for idx, w in enumerate(chunk.words):
+                        if w.start <= current_time <= w.end:
+                            active_word_idx = idx
+                            break
+                    if active_word_idx == -1 and chunk.words:
+                        for idx, w in enumerate(chunk.words):
+                            if current_time >= w.start:
+                                active_word_idx = idx
+                    break
+
+            if not active_chunk or not active_chunk.meta:
+                return frame
+
+            meta = active_chunk.meta
+            base_font = self.font_mgr.get_font(meta.font_size, font_family=self.style.font_family)
+
+            if needs_alpha:
+                # ── Advanced RGBA Overlay Compositing ──────────────────────────────
+                pil_base = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(overlay)
+
+                glow_overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0)) if self.style.glow else None
+                glow_draw = ImageDraw.Draw(glow_overlay) if glow_overlay else None
+
+                fade_mult = 1.0
+                if self.style.chunk_fade_in:
+                    dt = current_time - active_chunk.start
+                    if 0.0 <= dt < self.style.chunk_fade_duration:
+                        fade_mult = max(0.1, min(1.0, dt / self.style.chunk_fade_duration))
+
+                x_start = (width - meta.total_width) / 2.0
+
+                if self.style.chunk_bg:
+                    sample_box = draw.textbbox((0, 0), "Ag", font=base_font)
+                    line_h = sample_box[3] - sample_box[1]
+                    pad_x, pad_y = self.style.chunk_bg_padding
+                    c_rect = [
+                        x_start - pad_x,
+                        y_pos - pad_y,
+                        x_start + meta.total_width + pad_x,
+                        y_pos + line_h + pad_y + 4
+                    ]
+                    bg_fill = self.style.chunk_bg_fill
+                    if fade_mult < 1.0:
+                        bg_fill = (*bg_fill[:3], int(bg_fill[3] * fade_mult))
+                    border = self.style.chunk_bg_border
+                    if border and fade_mult < 1.0:
+                        border = (*border[:3], int(border[3] * fade_mult))
+                    draw.rounded_rectangle(
+                        c_rect,
+                        radius=self.style.chunk_bg_radius,
+                        fill=bg_fill,
+                        outline=border,
+                        width=1
+                    )
+
+                active_font = (
+                    self.font_mgr.get_font(int(meta.font_size * self.style.bounce_scale), font_family=self.style.font_family)
+                    if self.style.word_bounce
+                    else base_font
+                )
+
+                x_cursor = x_start
+                for idx, w in enumerate(active_chunk.words):
+                    txt = w.word.upper() if self.style.uppercase else w.word
+                    assert not DEV.search(txt) and txt.isascii(), f"Non-Latin token in renderer: {txt!r}"
+
+                    slot_w = meta.word_widths[idx]
+                    x_center = x_cursor + slot_w / 2.0
+                    is_active = (idx == active_word_idx)
+                    is_past = (active_word_idx != -1 and idx < active_word_idx)
+                    is_upcoming = (active_word_idx != -1 and idx > active_word_idx)
+
+                    if is_active:
+                        font = active_font
+                        word_len = draw.textlength(txt, font=font)
+                        x_draw = x_center - word_len / 2.0
+                        y_draw = y_pos + (self.style.bounce_y_offset if self.style.word_bounce else 0)
+
+                        if self.style.active_box_highlight:
+                            pad_bx, pad_by = self.style.active_box_padding
+                            bbox = draw.textbbox((x_draw, y_draw), txt, font=font)
+                            box_coords = [
+                                bbox[0] - pad_bx,
+                                bbox[1] - pad_by,
+                                bbox[2] + pad_bx,
+                                bbox[3] + pad_by
+                            ]
+                            box_fill = self.style.active_box_fill
+                            if fade_mult < 1.0:
+                                box_fill = (*box_fill[:3], int(box_fill[3] * fade_mult))
+                            draw.rounded_rectangle(
+                                box_coords,
+                                radius=self.style.active_box_radius,
+                                fill=box_fill
+                            )
+                            alpha = int(255 * fade_mult)
+                            draw.text(
+                                (x_draw, y_draw),
+                                txt,
+                                font=font,
+                                fill=(*self.style.active_box_text_color, alpha)
+                            )
+                        else:
+                            if glow_draw:
+                                g_alpha = int(220 * fade_mult)
+                                glow_draw.text(
+                                    (x_draw, y_draw),
+                                    txt,
+                                    font=font,
+                                    fill=(*self.style.glow_color, g_alpha),
+                                    stroke_width=self.style.glow_stroke,
+                                    stroke_fill=(*self.style.glow_color, g_alpha)
+                                )
+
+                            if self.style.shadow_3d:
+                                s_alpha = int(255 * fade_mult)
+                                for d in range(1, self.style.shadow_3d_depth + 1):
+                                    draw.text(
+                                        (x_draw + int(d * 0.75), y_draw + d),
+                                        txt,
+                                        font=font,
+                                        fill=(*self.style.shadow_3d_color, s_alpha),
+                                        stroke_width=self.style.stroke_width,
+                                        stroke_fill=(*self.style.shadow_3d_color, s_alpha)
+                                    )
+                            elif self.style.shadow_offset:
+                                sx = x_draw + self.style.shadow_offset[0]
+                                sy = y_draw + self.style.shadow_offset[1]
+                                s_alpha = int(self.style.shadow_color[3] * fade_mult)
+                                draw.text(
+                                    (sx, sy),
+                                    txt,
+                                    font=font,
+                                    fill=(*self.style.shadow_color[:3], s_alpha),
+                                    stroke_width=self.style.stroke_width,
+                                    stroke_fill=(*self.style.shadow_color[:3], s_alpha)
+                                )
+
+                            alpha = int(255 * fade_mult)
+                            draw.text(
+                                (x_draw, y_draw),
+                                txt,
+                                font=font,
+                                fill=(*self.style.active_color, alpha),
+                                stroke_width=self.style.stroke_width,
+                                stroke_fill=(*self.style.stroke_color, alpha)
+                            )
+                    else:
+                        font = base_font
+                        x_draw = x_cursor
+                        y_draw = y_pos
+                        base_alpha = self.style.future_alpha if is_upcoming else self.style.past_alpha
+                        alpha = int(base_alpha * fade_mult)
+
+                        if glow_draw:
+                            g_alpha = int(60 * (alpha / 255.0))
+                            glow_draw.text(
+                                (x_draw, y_draw),
+                                txt,
+                                font=font,
+                                fill=(255, 255, 255, g_alpha),
+                                stroke_width=3,
+                                stroke_fill=(255, 255, 255, g_alpha)
+                            )
+
+                        if self.style.shadow_offset:
+                            sx = x_draw + self.style.shadow_offset[0]
+                            sy = y_draw + self.style.shadow_offset[1]
+                            s_alpha = int(self.style.shadow_color[3] * (alpha / 255.0))
+                            draw.text(
+                                (sx, sy),
+                                txt,
+                                font=font,
+                                fill=(*self.style.shadow_color[:3], s_alpha),
+                                stroke_width=self.style.stroke_width,
+                                stroke_fill=(*self.style.shadow_color[:3], s_alpha)
+                            )
+                        draw.text(
+                            (x_draw, y_draw),
+                            txt,
+                            font=font,
+                            fill=(*self.style.inactive_color, alpha),
+                            stroke_width=self.style.stroke_width,
+                            stroke_fill=(*self.style.stroke_color, alpha)
+                        )
+
+                    x_cursor += slot_w + meta.space_width
+
+                pil_rgba = pil_base.convert("RGBA")
+                if glow_overlay:
+                    glow_blurred = glow_overlay.filter(ImageFilter.GaussianBlur(radius=self.style.glow_radius))
+                    pil_rgba = Image.alpha_composite(pil_rgba, glow_blurred)
+                pil_rgba = Image.alpha_composite(pil_rgba, overlay)
+                return cv2.cvtColor(np.array(pil_rgba.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+            else:
+                # ── Direct RGB Drawing (Zero-Overhead for Classic-Yellow) ─────────
+                pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(pil_image)
+
+                x_cursor = (width - meta.total_width) / 2.0
+                for idx, w in enumerate(active_chunk.words):
+                    txt = w.word.upper() if self.style.uppercase else w.word
+                    assert not DEV.search(txt) and txt.isascii(), f"Non-Latin token in renderer: {txt!r}"
+
+                    fill_color = self.active_color if idx == active_word_idx else self.inactive_color
+                    draw.text(
+                        (x_cursor, y_pos),
+                        txt,
+                        font=base_font,
+                        fill=fill_color,
+                        stroke_width=self.stroke_width,
+                        stroke_fill=self.stroke_color
+                    )
+                    x_cursor += meta.word_widths[idx] + meta.space_width
+
+                return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+
+        return compose
+
     def render_to_video(
         self,
         input_video: Path | str,
@@ -574,29 +847,12 @@ class CaptionRenderer:
 
         print(f"[caption] Input: {width}x{height} @ {fps:.2f}fps ({total_frames} frames)")
         print(f"[caption] Style: '{self.style.name}' ({self.style.description})")
-        chunks = self.build_chunks(words)
-        self.calculate_layouts(chunks, width, height)
+
+        compose = self.create_composer(words, width, height)
 
         is_widescreen = (width > height)
-        if is_widescreen:
-            # In 16:9 widescreen, default 380px offset would sit in middle of screen.
-            # Auto-adapt to clean lower-margin position unless custom offset provided.
-            if self.bottom_offset == 380:
-                effective_bottom_offset = min(120, max(45, int(height * 0.11)))
-            else:
-                effective_bottom_offset = self.bottom_offset
-        elif height <= 1450 and width < height:
-            # 4:5 Instagram Portrait Feed (1080x1350)
-            if self.bottom_offset == 380:
-                effective_bottom_offset = int(height * 0.18)  # ~243px for 1350h
-            else:
-                effective_bottom_offset = self.bottom_offset
-        else:
-            effective_bottom_offset = self.bottom_offset
-
-        y_pos = max(30, height - effective_bottom_offset + self.style.bottom_offset_adjust)
         aspect_desc = '16:9' if is_widescreen else ('4:5' if height <= 1450 else '9:16')
-        print(f"[caption] Prepared {len(chunks)} caption chunks. Burning captions at y={y_pos} (aspect={aspect_desc})...")
+        print(f"[caption] Burning captions (aspect={aspect_desc})...")
 
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
@@ -611,17 +867,6 @@ class CaptionRenderer:
         ]
         proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
 
-        # Detect whether advanced RGBA compositing is needed (for pills, shadows, alpha ramps, glow)
-        needs_alpha = (
-            self.style.chunk_bg
-            or self.style.active_box_highlight
-            or self.style.shadow_offset is not None
-            or self.style.future_alpha < 255
-            or self.style.chunk_fade_in
-            or self.style.glow
-            or self.style.shadow_3d
-        )
-
         frame_idx = 0
         try:
             while True:
@@ -631,244 +876,7 @@ class CaptionRenderer:
                 current_time = frame_idx / fps
                 frame_idx += 1
 
-                # Locate active chunk for current timestamp
-                active_chunk: Optional[CaptionChunk] = None
-                active_word_idx = -1
-
-                for chunk in chunks:
-                    if chunk.start <= current_time <= chunk.end + 0.20:
-                        active_chunk = chunk
-                        for idx, w in enumerate(chunk.words):
-                            if w.start <= current_time <= w.end:
-                                active_word_idx = idx
-                                break
-                        # If between words during natural pause, keep last spoken word active
-                        if active_word_idx == -1 and chunk.words:
-                            for idx, w in enumerate(chunk.words):
-                                if current_time >= w.start:
-                                    active_word_idx = idx
-                        break
-
-                if active_chunk and active_chunk.meta:
-                    meta = active_chunk.meta
-                    base_font = self.font_mgr.get_font(meta.font_size, font_family=self.style.font_family)
-
-                    if needs_alpha:
-                        # ── Advanced RGBA Overlay Compositing ──────────────────────────────
-                        pil_base = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-                        draw = ImageDraw.Draw(overlay)
-
-                        # Optical bloom / glow layer (AE Glow simulation)
-                        glow_overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0)) if self.style.glow else None
-                        glow_draw = ImageDraw.Draw(glow_overlay) if glow_overlay else None
-
-                        # Chunk entry fade-in
-                        fade_mult = 1.0
-                        if self.style.chunk_fade_in:
-                            dt = current_time - active_chunk.start
-                            if 0.0 <= dt < self.style.chunk_fade_duration:
-                                fade_mult = max(0.1, min(1.0, dt / self.style.chunk_fade_duration))
-
-                        x_start = (width - meta.total_width) / 2.0
-
-                        # A. Chunk container pill backdrop
-                        if self.style.chunk_bg:
-                            sample_box = draw.textbbox((0, 0), "Ag", font=base_font)
-                            line_h = sample_box[3] - sample_box[1]
-                            pad_x, pad_y = self.style.chunk_bg_padding
-                            c_rect = [
-                                x_start - pad_x,
-                                y_pos - pad_y,
-                                x_start + meta.total_width + pad_x,
-                                y_pos + line_h + pad_y + 4
-                            ]
-                            bg_fill = self.style.chunk_bg_fill
-                            if fade_mult < 1.0:
-                                bg_fill = (*bg_fill[:3], int(bg_fill[3] * fade_mult))
-                            border = self.style.chunk_bg_border
-                            if border and fade_mult < 1.0:
-                                border = (*border[:3], int(border[3] * fade_mult))
-                            draw.rounded_rectangle(
-                                c_rect,
-                                radius=self.style.chunk_bg_radius,
-                                fill=bg_fill,
-                                outline=border,
-                                width=1
-                            )
-
-                        # B. Active font for bounce effect
-                        active_font = (
-                            self.font_mgr.get_font(int(meta.font_size * self.style.bounce_scale), font_family=self.style.font_family)
-                            if self.style.word_bounce
-                            else base_font
-                        )
-
-                        # C. Render words
-                        x_cursor = x_start
-                        for idx, w in enumerate(active_chunk.words):
-                            txt = w.word.upper() if self.style.uppercase else w.word
-                            # Strict invariant asserting Latin characters only
-                            assert not DEV.search(txt) and txt.isascii(), f"Non-Latin token in renderer: {txt!r}"
-
-                            slot_w = meta.word_widths[idx]
-                            x_center = x_cursor + slot_w / 2.0
-                            is_active = (idx == active_word_idx)
-                            is_past = (active_word_idx != -1 and idx < active_word_idx)
-                            is_upcoming = (active_word_idx != -1 and idx > active_word_idx)
-
-                            if is_active:
-                                font = active_font
-                                word_len = draw.textlength(txt, font=font)
-                                x_draw = x_center - word_len / 2.0
-                                y_draw = y_pos + (self.style.bounce_y_offset if self.style.word_bounce else 0)
-
-                                if self.style.active_box_highlight:
-                                    # Active word pill/box
-                                    pad_bx, pad_by = self.style.active_box_padding
-                                    bbox = draw.textbbox((x_draw, y_draw), txt, font=font)
-                                    box_coords = [
-                                        bbox[0] - pad_bx,
-                                        bbox[1] - pad_by,
-                                        bbox[2] + pad_bx,
-                                        bbox[3] + pad_by
-                                    ]
-                                    box_fill = self.style.active_box_fill
-                                    if fade_mult < 1.0:
-                                        box_fill = (*box_fill[:3], int(box_fill[3] * fade_mult))
-                                    draw.rounded_rectangle(
-                                        box_coords,
-                                        radius=self.style.active_box_radius,
-                                        fill=box_fill
-                                    )
-                                    # Dark text inside active pill
-                                    alpha = int(255 * fade_mult)
-                                    draw.text(
-                                        (x_draw, y_draw),
-                                        txt,
-                                        font=font,
-                                        fill=(*self.style.active_box_text_color, alpha)
-                                    )
-                                else:
-                                    # Optical bloom for active word (AE Deep Glow simulation)
-                                    if glow_draw:
-                                        g_alpha = int(220 * fade_mult)
-                                        glow_draw.text(
-                                            (x_draw, y_draw),
-                                            txt,
-                                            font=font,
-                                            fill=(*self.style.glow_color, g_alpha),
-                                            stroke_width=self.style.glow_stroke,
-                                            stroke_fill=(*self.style.glow_color, g_alpha)
-                                        )
-
-                                    # 3D Extrusion Shadow (directional depth)
-                                    if self.style.shadow_3d:
-                                        s_alpha = int(255 * fade_mult)
-                                        for d in range(1, self.style.shadow_3d_depth + 1):
-                                            draw.text(
-                                                (x_draw + int(d * 0.75), y_draw + d),
-                                                txt,
-                                                font=font,
-                                                fill=(*self.style.shadow_3d_color, s_alpha),
-                                                stroke_width=self.style.stroke_width,
-                                                stroke_fill=(*self.style.shadow_3d_color, s_alpha)
-                                            )
-                                    elif self.style.shadow_offset:
-                                        sx = x_draw + self.style.shadow_offset[0]
-                                        sy = y_draw + self.style.shadow_offset[1]
-                                        s_alpha = int(self.style.shadow_color[3] * fade_mult)
-                                        draw.text(
-                                            (sx, sy),
-                                            txt,
-                                            font=font,
-                                            fill=(*self.style.shadow_color[:3], s_alpha),
-                                            stroke_width=self.style.stroke_width,
-                                            stroke_fill=(*self.style.shadow_color[:3], s_alpha)
-                                        )
-
-                                    alpha = int(255 * fade_mult)
-                                    draw.text(
-                                        (x_draw, y_draw),
-                                        txt,
-                                        font=font,
-                                        fill=(*self.style.active_color, alpha),
-                                        stroke_width=self.style.stroke_width,
-                                        stroke_fill=(*self.style.stroke_color, alpha)
-                                    )
-                            else:
-                                # Inactive word (past or upcoming)
-                                font = base_font
-                                x_draw = x_cursor
-                                y_draw = y_pos
-                                base_alpha = self.style.future_alpha if is_upcoming else self.style.past_alpha
-                                alpha = int(base_alpha * fade_mult)
-
-                                if glow_draw:
-                                    g_alpha = int(60 * (alpha / 255.0))
-                                    glow_draw.text(
-                                        (x_draw, y_draw),
-                                        txt,
-                                        font=font,
-                                        fill=(255, 255, 255, g_alpha),
-                                        stroke_width=3,
-                                        stroke_fill=(255, 255, 255, g_alpha)
-                                    )
-
-                                if self.style.shadow_offset:
-                                    sx = x_draw + self.style.shadow_offset[0]
-                                    sy = y_draw + self.style.shadow_offset[1]
-                                    s_alpha = int(self.style.shadow_color[3] * (alpha / 255.0))
-                                    draw.text(
-                                        (sx, sy),
-                                        txt,
-                                        font=font,
-                                        fill=(*self.style.shadow_color[:3], s_alpha),
-                                        stroke_width=self.style.stroke_width,
-                                        stroke_fill=(*self.style.shadow_color[:3], s_alpha)
-                                    )
-                                draw.text(
-                                    (x_draw, y_draw),
-                                    txt,
-                                    font=font,
-                                    fill=(*self.style.inactive_color, alpha),
-                                    stroke_width=self.style.stroke_width,
-                                    stroke_fill=(*self.style.stroke_color, alpha)
-                                )
-
-                            x_cursor += slot_w + meta.space_width
-
-                        pil_rgba = pil_base.convert("RGBA")
-                        if glow_overlay:
-                            # Apply two-stage Gaussian blur for smooth organic AE bloom
-                            glow_blurred = glow_overlay.filter(ImageFilter.GaussianBlur(radius=self.style.glow_radius))
-                            pil_rgba = Image.alpha_composite(pil_rgba, glow_blurred)
-                        pil_rgba = Image.alpha_composite(pil_rgba, overlay)
-                        frame = cv2.cvtColor(np.array(pil_rgba.convert("RGB")), cv2.COLOR_RGB2BGR)
-
-                    else:
-                        # ── Direct RGB Drawing (Zero-Overhead for Classic-Yellow) ─────────
-                        pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                        draw = ImageDraw.Draw(pil_image)
-
-                        x_cursor = (width - meta.total_width) / 2.0
-                        for idx, w in enumerate(active_chunk.words):
-                            txt = w.word.upper() if self.style.uppercase else w.word
-                            # Strict invariant asserting Latin characters only
-                            assert not DEV.search(txt) and txt.isascii(), f"Non-Latin token in renderer: {txt!r}"
-
-                            fill_color = self.active_color if idx == active_word_idx else self.inactive_color
-                            draw.text(
-                                (x_cursor, y_pos),
-                                txt,
-                                font=base_font,
-                                fill=fill_color,
-                                stroke_width=self.stroke_width,
-                                stroke_fill=self.stroke_color
-                            )
-                            x_cursor += meta.word_widths[idx] + meta.space_width
-
-                        frame = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+                frame = compose(frame, current_time)
 
                 if proc.stdin:
                     proc.stdin.write(frame.tobytes())

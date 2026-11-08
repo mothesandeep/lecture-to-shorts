@@ -87,6 +87,36 @@ def list_reframe_presets() -> List[str]:
 
 
 @dataclass
+class ReframePlan:
+    """Precomputed reframing trajectory and geometry for video rendering."""
+    src_path: Path
+    out_path: Path
+    width: int
+    height: int
+    fps: float
+    total_frames: int
+    num_frames: int
+    crop_w: int
+    crop_h: int
+    out_canvas_w: int
+    out_canvas_h: int
+    crop_x0: np.ndarray
+    crop_y0: np.ndarray
+    scene_cuts: List[int]
+    cut_indices: set[int]
+    layout: str
+    is_4_5: bool
+    zoom: float
+    preset_name: str
+    headroom: float
+    encoder_preset: str
+    crf: int
+    audio_bitrate: str
+    detections: Optional[List[List[Tuple[float, float, int, int, float]]]] = None
+    static_centers: Optional[List[np.ndarray]] = None
+
+
+@dataclass
 class ReframeConfig:
     """Configuration options for auto-reframing."""
     src: Path
@@ -355,8 +385,16 @@ class FaceReframer:
             "reframe render": 0.0,
         }
 
-    def run(self) -> Path:
-        """Execute reframing and write vertical / portrait output video."""
+    def plan(self) -> ReframePlan:
+        """
+        Execute passes 1 to 2.7 of face reframing:
+        - Face detection, motion analysis, scene-cut boundary detection.
+        - Static slide rejection.
+        - Teacher locking with cut-aware reset.
+        - Dead-zone dampening, motion lead, and segmented smoothing.
+        - Anti-corner and headroom framing invariants.
+        Returns a ReframePlan containing crop geometry and per-frame crop coordinates.
+        """
         src_path = self.config.src.expanduser().resolve()
         out_path = self.config.out.expanduser().resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -663,8 +701,62 @@ class FaceReframer:
                     ])
             print(f"[reframe] Exported crop keyframes to: {csv_file}")
 
+        self.time_pass1 = time.time() - t_pass1_start
+        self.stage_timings["reframe pass 1"] = self.time_pass1
+
+        return ReframePlan(
+            src_path=src_path,
+            out_path=out_path,
+            width=width,
+            height=height,
+            fps=fps,
+            total_frames=total_frames,
+            num_frames=num_frames,
+            crop_w=crop_w,
+            crop_h=crop_h,
+            out_canvas_w=out_canvas_w,
+            out_canvas_h=out_canvas_h,
+            crop_x0=crop_x0,
+            crop_y0=crop_y0,
+            scene_cuts=scene_cuts,
+            cut_indices=cut_indices,
+            layout=self.layout,
+            is_4_5=is_4_5,
+            zoom=zoom,
+            preset_name=self.preset_name,
+            headroom=self.headroom,
+            encoder_preset=self.encoder_preset,
+            crf=self.config.crf,
+            audio_bitrate=self.config.audio_bitrate,
+            detections=detections,
+            static_centers=static_centers,
+        )
+
+    def render(self, plan: Optional[ReframePlan] = None) -> Path:
+        """
+        Execute pass 3 of face reframing:
+        Encode the cropped frames to out_path using FFmpeg rawvideo pipe.
+        """
+        if plan is None:
+            plan = self.plan()
+
+        t_render_start = time.time()
+        src_path = plan.src_path
+        out_path = plan.out_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        crop_w, crop_h = plan.crop_w, plan.crop_h
+        fps = plan.fps
+        out_canvas_w, out_canvas_h = plan.out_canvas_w, plan.out_canvas_h
+        is_4_5 = plan.is_4_5
+        crop_x0 = plan.crop_x0
+        crop_y0 = plan.crop_y0
+        num_frames = plan.num_frames
+        cut_indices = plan.cut_indices
+        zoom = plan.zoom
+
         # ---------------- PASS 3: FFmpeg Rendering & Encoding ----------------
-        if self.layout == "blur-bw":
+        if plan.layout == "blur-bw":
             print(f"[reframe] Encoding 9:16 aesthetic blur-bw video via FFmpeg filter_complex -> {out_path}")
             filter_complex = (
                 "[1:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5,format=gray,format=yuv420p[bg]; "
@@ -679,8 +771,8 @@ class FaceReframer:
                 "-filter_complex", filter_complex,
                 "-map", "[v]", "-map", "[a]",
                 "-fps_mode", "cfr",
-                "-c:v", "libx264", "-preset", self.encoder_preset, "-crf", str(self.config.crf), "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", self.config.audio_bitrate, "-shortest",
+                "-c:v", "libx264", "-preset", plan.encoder_preset, "-crf", str(plan.crf), "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", plan.audio_bitrate, "-shortest",
                 "-movflags", "+faststart", str(out_path)
             ]
         else:
@@ -694,13 +786,11 @@ class FaceReframer:
                 "-vf", f"scale={out_canvas_w}:{out_canvas_h}:flags=lanczos,format=yuv420p",
                 "-af", "asetpts=PTS-STARTPTS,aresample=async=1000:first_pts=0",
                 "-fps_mode", "cfr",
-                "-c:v", "libx264", "-preset", self.encoder_preset, "-crf", str(self.config.crf),
-                "-c:a", "aac", "-b:a", self.config.audio_bitrate, "-shortest",
+                "-c:v", "libx264", "-preset", plan.encoder_preset, "-crf", str(plan.crf),
+                "-c:a", "aac", "-b:a", plan.audio_bitrate, "-shortest",
                 "-movflags", "+faststart", str(out_path)
             ]
-        self.time_pass1 = time.time() - t_pass1_start
-        self.stage_timings["reframe pass 1"] = self.time_pass1
-        t_render_start = time.time()
+
         proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
 
         debug_writer: Optional[cv2.VideoWriter] = None
@@ -710,9 +800,14 @@ class FaceReframer:
                 str(dbg_path),
                 cv2.VideoWriter_fourcc(*"mp4v"),
                 fps,
-                (width, height)
+                (plan.width, plan.height)
             )
             print(f"[reframe] Debug overlay enabled -> {dbg_path}")
+
+        static_centers = plan.static_centers or []
+
+        def is_static_detection(cx: float, cy: float) -> bool:
+            return any(np.hypot(cx - sc[0], cy - sc[1]) < 35.0 for sc in static_centers)
 
         cap = cv2.VideoCapture(str(src_path))
         try:
@@ -727,10 +822,11 @@ class FaceReframer:
 
                 if debug_writer is not None:
                     vis = frame.copy()
-                    for (dx, dy, dw, dh, m) in detections[t]:
-                        color = (0, 0, 255) if is_static_detection(dx, dy) else (0, 255, 0)
-                        cv2.rectangle(vis, (int(dx - dw / 2), int(dy - dh / 2)),
-                                      (int(dx + dw / 2), int(dy + dh / 2)), color, 2)
+                    if plan.detections and t < len(plan.detections):
+                        for (dx, dy, dw, dh, m) in plan.detections[t]:
+                            color = (0, 0, 255) if is_static_detection(dx, dy) else (0, 255, 0)
+                            cv2.rectangle(vis, (int(dx - dw / 2), int(dy - dh / 2)),
+                                          (int(dx + dw / 2), int(dy + dh / 2)), color, 2)
                     x0, y0 = int(crop_x0[t]), int(crop_y0[t])
                     cv2.rectangle(vis, (x0, y0), (x0 + crop_w, y0 + crop_h), (255, 200, 0), 2)
                     # Upper-third eyeline guideline
@@ -757,6 +853,11 @@ class FaceReframer:
         self.stage_timings["reframe render"] = self.time_render
         print(f"[reframe] Success! Reframed video created at: {out_path}")
         return out_path
+
+    def run(self) -> Path:
+        """Execute reframing: plan passes 1-2.7 and render pass 3 in sequence."""
+        plan = self.plan()
+        return self.render(plan)
 
 
 def reframe_video(

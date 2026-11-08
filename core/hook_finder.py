@@ -386,7 +386,8 @@ def cut_snippet_without_reencode(
     start_time: float,
     end_time: float,
     target_fps: Optional[float] = None,
-    audio_delay_ms: float = 500.0
+    audio_delay_ms: float = 500.0,
+    crf: int = 10,
 ) -> Path:
     """
     Cut selected time snippet from source video with strict audio-video sync,
@@ -398,7 +399,8 @@ def cut_snippet_without_reencode(
         start_time=start_time,
         end_time=end_time,
         target_fps=target_fps,
-        audio_delay_ms=audio_delay_ms
+        audio_delay_ms=audio_delay_ms,
+        crf=crf,
     )
 
 
