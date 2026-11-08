@@ -144,6 +144,7 @@ def prepare_clip(
     whisper_backend: str = "auto",
     legacy_render: bool = False,
     detect_every: int = 3,
+    punch_in: str = "off",
 ) -> PreparedClip:
     """
     Prepare clip N: snippet cut, reframing plan, word timestamps, and romanization.
@@ -252,7 +253,7 @@ def prepare_clip(
             time_reframe_render = 0.0
         else:
             reframe_label = "4:5 portrait" if is_4_5 else ("1:1 blur-bw" if layout == "blur-bw" else "9:16 vertical")
-            print(f"\n[Clip {clip_info.clip_id}] [2/4] Face-tracking {reframe_label} reframing (layout={layout}, aspect={target_aspect})...")
+            print(f"\n[Clip {clip_info.clip_id}] [2/4] Face-tracking {reframe_label} reframing (layout={layout}, aspect={target_aspect}, punch_in={punch_in})...")
             reframe_cfg = ReframeConfig(
                 src=snippet_path,
                 out=reframed_path,
@@ -262,6 +263,7 @@ def prepare_clip(
                 audio_delay_ms=0.0,
                 aspect_ratio=target_aspect,
                 detect_every=detect_every,
+                punch_in=punch_in,
             )
             reframer = FaceReframer(reframe_cfg)
             reframer.run()
@@ -290,32 +292,9 @@ def prepare_clip(
             time_whisper = getattr(transcriber, "time_whisper", 0.0)
             time_romanize = getattr(transcriber, "time_romanize", 0.0)
     else:
-        # Step B: Compute reframing plan (trajectory, geometry, scene cuts)
-        if is_widescreen:
-            print(f"\n[Clip {clip_info.clip_id}] [2/4] Preserving native 16:9 widescreen format (bypassing FaceReframer)...")
-            time_reframe_p1 = 0.0
-        else:
-            reframe_label = "4:5 portrait" if is_4_5 else ("1:1 blur-bw" if layout == "blur-bw" else "9:16 vertical")
-            print(f"\n[Clip {clip_info.clip_id}] [2/4] Planning face-tracking {reframe_label} reframing (layout={layout}, aspect={target_aspect})...")
-            reframe_cfg = ReframeConfig(
-                src=snippet_path,
-                out=reframed_path,
-                smooth_alpha=smooth_alpha,
-                preset=reframe_preset,
-                layout=layout,
-                audio_delay_ms=0.0,
-                aspect_ratio=target_aspect,
-                detect_every=detect_every,
-            )
-            reframer = FaceReframer(reframe_cfg)
-            plan = reframer.plan()
-            time_reframe_p1 = getattr(reframer, "time_pass1", 0.0)
-            if save_intermediate:
-                reframer.render(plan)
-
-        # Step C: Word-level Whisper transcription & Gemini Hinglish romanization
+        # Step B: Word-level Whisper transcription & Gemini Hinglish romanization
         if not no_caption:
-            print(f"\n[Clip {clip_info.clip_id}] [3/4] Word-level Whisper STT & Hinglish transliteration...")
+            print(f"\n[Clip {clip_info.clip_id}] [2/4] Word-level Whisper STT & Hinglish transliteration...")
             transcriber = HinglishTranscriber(
                 whisper_model=whisper_clip_model,
                 llm_model=llm_model,
@@ -334,7 +313,32 @@ def prepare_clip(
             time_whisper = getattr(transcriber, "time_whisper", 0.0)
             time_romanize = getattr(transcriber, "time_romanize", 0.0)
         else:
-            print(f"\n[Clip {clip_info.clip_id}] [3/4] Captions disabled (--no-caption). Bypassing Whisper & transliteration...")
+            print(f"\n[Clip {clip_info.clip_id}] [2/4] Captions disabled (--no-caption). Bypassing Whisper & transliteration...")
+
+        # Step C: Compute reframing plan (trajectory, geometry, scene cuts)
+        if is_widescreen:
+            print(f"\n[Clip {clip_info.clip_id}] [3/4] Preserving native 16:9 widescreen format (bypassing FaceReframer)...")
+            time_reframe_p1 = 0.0
+        else:
+            reframe_label = "4:5 portrait" if is_4_5 else ("1:1 blur-bw" if layout == "blur-bw" else "9:16 vertical")
+            print(f"\n[Clip {clip_info.clip_id}] [3/4] Planning face-tracking {reframe_label} reframing (layout={layout}, aspect={target_aspect}, punch_in={punch_in})...")
+            reframe_cfg = ReframeConfig(
+                src=snippet_path,
+                out=reframed_path,
+                smooth_alpha=smooth_alpha,
+                preset=reframe_preset,
+                layout=layout,
+                audio_delay_ms=0.0,
+                aspect_ratio=target_aspect,
+                detect_every=detect_every,
+                punch_in=punch_in,
+                words=words,
+            )
+            reframer = FaceReframer(reframe_cfg)
+            plan = reframer.plan(words=words)
+            time_reframe_p1 = getattr(reframer, "time_pass1", 0.0)
+            if save_intermediate:
+                reframer.render(plan)
 
     chosen_style = style
     effective_chunk_size = chunk_size
@@ -500,6 +504,7 @@ def process_single_clip(
     legacy_render: bool = False,
     fast: bool = False,
     detect_every: int = 3,
+    punch_in: str = "off",
 ) -> Path:
     """Process a single clip through prepare + render."""
     prepared = prepare_clip(
@@ -525,6 +530,7 @@ def process_single_clip(
         whisper_backend=whisper_backend,
         legacy_render=legacy_render,
         detect_every=detect_every,
+        punch_in=punch_in,
     )
     return render_prepared_clip(
         prepared=prepared,
@@ -560,6 +566,7 @@ def process_clips_pipelined(
     legacy_render: bool = False,
     fast: bool = False,
     detect_every: int = 3,
+    punch_in: str = "off",
 ) -> Tuple[List[Path], List[dict]]:
     """
     Process multiple clips with pipelined preparation:
@@ -596,6 +603,7 @@ def process_clips_pipelined(
             whisper_backend=whisper_backend,
             legacy_render=legacy_render,
             detect_every=detect_every,
+            punch_in=punch_in,
         )
 
     # Use ThreadPoolExecutor(max_workers=1) to pipeline preparation of clip N+1 while clip N renders
@@ -705,6 +713,7 @@ def handle_run(args: argparse.Namespace) -> None:
         legacy_render=getattr(args, "legacy_render", False),
         fast=getattr(args, "fast", False),
         detect_every=getattr(args, "detect_every", 3),
+        punch_in=getattr(args, "punch_in", "off"),
     )
 
     # 3. Export Social Media Metadata JSON
@@ -882,6 +891,7 @@ def handle_interactive(args: argparse.Namespace, existing_clips: Optional[List[V
         legacy_render=getattr(args, "legacy_render", False),
         fast=getattr(args, "fast", False),
         detect_every=getattr(args, "detect_every", 3),
+        punch_in=getattr(args, "punch_in", "off"),
     )
 
     print("\n" + "=" * 70)
@@ -953,6 +963,7 @@ def handle_clip(args: argparse.Namespace) -> None:
         legacy_render=getattr(args, "legacy_render", False),
         fast=getattr(args, "fast", False),
         detect_every=getattr(args, "detect_every", 3),
+        punch_in=getattr(args, "punch_in", "off"),
     )
 
 
@@ -986,9 +997,10 @@ def handle_reframe(args: argparse.Namespace) -> None:
         audio_delay_ms=args.audio_delay,
         detect_every=getattr(args, "detect_every", 3),
         detect_width=getattr(args, "detect_width", 320),
+        punch_in=getattr(args, "punch_in", "off"),
     )
     reframer = FaceReframer(reframe_cfg)
-    reframer.run()
+    reframer.run(fast=getattr(args, "fast", False))
 
 
 def handle_caption(args: argparse.Namespace) -> None:
@@ -1096,6 +1108,7 @@ Examples:
     p_run.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
     p_run.add_argument("--detect-every", type=int, default=3, help="Run face detection every Nth frame with template tracking in between (default: 3)")
     p_run.add_argument("--filter-face-presence", action="store_true", help="Filter vertical clips where teacher face is visible in < 70%% of frames")
+    p_run.add_argument("--punch-in", default="off", choices=["off", "auto"], help="Dynamic punch-in zoom on emphasis moments & RMS energy peaks (default: off)")
 
     # Command: 'interactive'
     p_inter = subparsers.add_parser("interactive", help="Interactive clip and aspect ratio selection with boundary re-verification")
@@ -1123,6 +1136,7 @@ Examples:
     p_inter.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
     p_inter.add_argument("--detect-every", type=int, default=3, help="Run face detection every Nth frame with template tracking in between (default: 3)")
     p_inter.add_argument("--filter-face-presence", action="store_true", help="Filter vertical clips where teacher face is visible in < 70%% of frames")
+    p_inter.add_argument("--punch-in", default="off", choices=["off", "auto"], help="Dynamic punch-in zoom on emphasis moments & RMS energy peaks (default: off)")
 
     # Command: 'detect'
     p_detect = subparsers.add_parser("detect", help="Detect viral moments & hooks without rendering video")
@@ -1178,6 +1192,7 @@ Examples:
     p_clip.add_argument("--legacy-render", action="store_true", help="Use legacy multi-step encoding (reframe encode -> caption encode) instead of single-pass render_reel")
     p_clip.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
     p_clip.add_argument("--detect-every", type=int, default=3, help="Run face detection every Nth frame with template tracking in between (default: 3)")
+    p_clip.add_argument("--punch-in", default="off", choices=["off", "auto"], help="Dynamic punch-in zoom on emphasis moments & RMS energy peaks (default: off)")
 
     # Command: 'reframe'
     p_reframe = subparsers.add_parser("reframe", help="Standalone face-tracking 9:16 vertical crop")
@@ -1199,6 +1214,7 @@ Examples:
     p_reframe.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
     p_reframe.add_argument("--detect-every", type=int, default=3, help="Run face detection every Nth frame with template tracking in between (default: 3)")
     p_reframe.add_argument("--detect-width", type=int, default=320, help="Downscale width for face detection (default: 320)")
+    p_reframe.add_argument("--punch-in", default="off", choices=["off", "auto"], help="Dynamic punch-in zoom on emphasis moments & RMS energy peaks (default: off)")
 
     # Command: 'caption'
     p_caption = subparsers.add_parser("caption", help="Standalone word-by-word captions on vertical video")

@@ -189,6 +189,11 @@ def render_reel(
 
                 # Transform / Crop / Scale
                 if plan is not None and crop_x0 is not None and crop_y0 is not None:
+                    x0 = float(crop_x0[t]) if t < len(crop_x0) else float(crop_x0[-1])
+                    y0 = float(crop_y0[t]) if t < len(crop_y0) else float(crop_y0[-1])
+                    w_t = float(plan.crop_w_arr[t]) if (plan.crop_w_arr is not None and t < len(plan.crop_w_arr)) else float(crop_w)
+                    h_t = float(plan.crop_h_arr[t]) if (plan.crop_h_arr is not None and t < len(plan.crop_h_arr)) else float(crop_h)
+
                     if layout == "blur-bw":
                         fh, fw = frame.shape[:2]
                         scale_bg = max(canvas_w / fw, canvas_h / fh)
@@ -201,26 +206,31 @@ def render_reel(
                         bg_blur = cv2.GaussianBlur(bg_gray, (51, 51), 0)
                         canvas_frame = cv2.cvtColor(bg_blur, cv2.COLOR_GRAY2BGR)
 
-                        x0 = int(round(crop_x0[t])) if t < len(crop_x0) else 0
-                        y0 = int(round(crop_y0[t])) if t < len(crop_y0) else 0
-                        fg_crop = frame[y0:y0 + crop_h, x0:x0 + crop_w]
-                        if fg_crop.shape[1] != 1080 or fg_crop.shape[0] != 1080:
-                            fg_crop = cv2.resize(fg_crop, (1080, 1080), interpolation=cv2.INTER_LANCZOS4)
+                        sx_fg = 1080.0 / w_t
+                        sy_fg = 1080.0 / h_t
+                        M_fg = np.float32([
+                            [sx_fg, 0, -sx_fg * x0],
+                            [0, sy_fg, -sy_fg * y0]
+                        ])
+                        fg_crop = cv2.warpAffine(frame, M_fg, (1080, 1080), flags=cv2.INTER_CUBIC)
                         canvas_frame[420:1500, 0:1080] = fg_crop
 
                         cv2.line(canvas_frame, (0, 419), (1080, 419), (90, 90, 90), 2)
                         cv2.line(canvas_frame, (0, 1500), (1080, 1500), (90, 90, 90), 2)
                     else:
-                        x0 = crop_x0[t] if t < len(crop_x0) else crop_x0[-1]
-                        y0 = crop_y0[t] if t < len(crop_y0) else crop_y0[-1]
-                        affine_matrix = np.float32([[1, 0, -x0], [0, 1, -y0]])
-                        cropped = cv2.warpAffine(frame, affine_matrix, (crop_w, crop_h), flags=cv2.INTER_LINEAR)
-                        if (crop_w, crop_h) != (canvas_w, canvas_h):
-                            canvas_frame = cv2.resize(cropped, (canvas_w, canvas_h), interpolation=cv2.INTER_LANCZOS4)
-                        else:
-                            canvas_frame = cropped
+                        # Single fused crop + scale warp directly to final canvas size
+                        sx = float(canvas_w) / w_t
+                        sy = float(canvas_h) / h_t
+                        M = np.float32([
+                            [sx, 0, -sx * x0],
+                            [0, sy, -sy * y0]
+                        ])
+                        canvas_frame = cv2.warpAffine(frame, M, (canvas_w, canvas_h), flags=cv2.INTER_CUBIC)
                 else:
-                    canvas_frame = frame
+                    if frame.shape[1] != canvas_w or frame.shape[0] != canvas_h:
+                        canvas_frame = cv2.resize(frame, (canvas_w, canvas_h), interpolation=cv2.INTER_CUBIC)
+                    else:
+                        canvas_frame = frame
 
                 # Compose Captions
                 if composer is not None:

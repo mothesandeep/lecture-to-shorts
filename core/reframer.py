@@ -35,8 +35,13 @@ import numpy as np
 
 try:
     from core.av_sync import ensure_cfr_video, probe_av_sync, verify_av_sync
+    from core.audio_features import AudioFeatureExtractor
 except ImportError:
-    from av_sync import ensure_cfr_video, probe_av_sync, verify_av_sync
+    try:
+        from av_sync import ensure_cfr_video, probe_av_sync, verify_av_sync
+        from audio_features import AudioFeatureExtractor
+    except ImportError:
+        AudioFeatureExtractor = None
 
 
 # ── Presets Catalog ──────────────────────────────────────────────────────────────────
@@ -117,6 +122,9 @@ class ReframePlan:
     lock_pct: float = 0.0
     num_valid_faces: int = 0
     detect_every: int = 3
+    crop_w_arr: Optional[np.ndarray] = None
+    crop_h_arr: Optional[np.ndarray] = None
+    zoom_curve: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -145,6 +153,9 @@ class ReframeConfig:
     aspect_ratio: str = "9:16"
     detect_every: int = 3
     detect_width: int = 320
+    punch_in: str = "off"
+    punch_in_events: Optional[List[Tuple[float, float]]] = None
+    words: Optional[List] = None
 
 
 def find_cascade(custom_path: Optional[Path | str] = None) -> Path:
@@ -273,30 +284,213 @@ def apply_deadzone_and_lead(
     return out
 
 
+def smoothstep(edge0: float, edge1: float, x: float | np.ndarray) -> float | np.ndarray:
+    """
+    Standard smoothstep ease-in / ease-out polynomial: S(u) = 3*u^2 - 2*u^3.
+    Maps x in [edge0, edge1] to [0.0, 1.0] with zero 1st derivatives at boundaries.
+    """
+    if edge0 == edge1:
+        if isinstance(x, np.ndarray):
+            return np.where(x < edge0, 0.0, 1.0)
+        return 0.0 if x < edge0 else 1.0
+    u = np.clip((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+    return u * u * (3.0 - 2.0 * u)
+
+
+def zoom_curve(
+    n: int,
+    fps: float,
+    events: List[Tuple[float, float]],
+    z_max: float = 1.20,
+    ramp: float = 0.35,
+) -> np.ndarray:
+    """
+    Generate per-frame punch-in zoom trajectory using smoothstep ease-in / ease-out.
+    
+    Args:
+        n: Total frame count.
+        fps: Frames per second.
+        events: List of (start_time_s, end_time_s) zoom intervals.
+        z_max: Peak punch-in zoom factor (e.g. 1.12x for <=480p, 1.25x for >=720p).
+        ramp: Transition ramp duration in seconds for ease-in and ease-out.
+        
+    Returns:
+        np.ndarray of shape (n,) with zoom multipliers in [1.0, z_max].
+    """
+    if n <= 0:
+        return np.array([], dtype=np.float32)
+    if fps <= 0:
+        fps = 25.0
+    if z_max <= 1.0 or not events:
+        return np.ones(n, dtype=np.float32)
+
+    times = np.arange(n, dtype=np.float32) / float(fps)
+    curve = np.ones(n, dtype=np.float32)
+    ramp_s = max(0.01, float(ramp))
+
+    for (start_t, end_t) in events:
+        start_t = float(start_t)
+        end_t = float(end_t)
+        if end_t <= start_t:
+            continue
+        dur = end_t - start_t
+        eff_ramp = min(ramp_s, dur / 2.0)
+
+        t_ramp_in_end = start_t + eff_ramp
+        t_ramp_out_start = end_t - eff_ramp
+
+        event_profile = np.zeros(n, dtype=np.float32)
+
+        mask_ramp_in = (times >= start_t) & (times < t_ramp_in_end)
+        mask_hold = (times >= t_ramp_in_end) & (times <= t_ramp_out_start)
+        mask_ramp_out = (times > t_ramp_out_start) & (times <= end_t)
+
+        if np.any(mask_ramp_in):
+            event_profile[mask_ramp_in] = smoothstep(start_t, t_ramp_in_end, times[mask_ramp_in])
+        if np.any(mask_hold):
+            event_profile[mask_hold] = 1.0
+        if np.any(mask_ramp_out):
+            event_profile[mask_ramp_out] = 1.0 - smoothstep(t_ramp_out_start, end_t, times[mask_ramp_out])
+
+        event_zoom = 1.0 + (z_max - 1.0) * event_profile
+        curve = np.maximum(curve, event_zoom)
+
+    return np.clip(curve, 1.0, z_max).astype(np.float32)
+
+
+def get_max_punch_in_zoom(height: int) -> float:
+    """
+    Cap dynamic punch-in zoom level by source video resolution to avoid blur / pixelation:
+    - 480p or lower (<= 480px height): cap at 1.12x.
+    - 720p or higher (>= 720px height): cap at 1.25x.
+    - Between 480p and 720p: linear interpolation.
+    """
+    if height <= 480:
+        return 1.12
+    elif height >= 720:
+        return 1.25
+    else:
+        ratio = (height - 480) / (720 - 480)
+        return round(1.12 + ratio * (1.25 - 1.12), 3)
+
+
+def detect_punch_in_events(
+    media_path: Optional[Path | str] = None,
+    words: Optional[List] = None,
+    min_gap_s: float = 3.0,
+    peak_z_threshold: float = 1.2,
+    hold_s: float = 1.4,
+) -> List[Tuple[float, float]]:
+    """
+    Detect punch-in zoom timestamps from:
+    1. Audio RMS energy peaks (AudioFeatureExtractor z >= 1.2).
+    2. Emphasis words (!, ?, ALL-CAPS >= 3 chars, or duration >= 0.45s).
+    
+    Enforces minimum spacing between events to prevent visual fatigue.
+    """
+    candidates: List[Tuple[float, float, float]] = []
+
+    if media_path and AudioFeatureExtractor is not None:
+        p = Path(media_path).expanduser().resolve()
+        if p.is_file():
+            try:
+                extractor = AudioFeatureExtractor.from_file(
+                    p,
+                    window_duration_s=2.0,
+                    hop_duration_s=1.0,
+                )
+                if len(extractor.window_centers) > 0 and len(extractor.energy_zscores) > 0:
+                    peak_mask = extractor.energy_zscores >= peak_z_threshold
+                    for center_t, z in zip(extractor.window_centers[peak_mask], extractor.energy_zscores[peak_mask]):
+                        t_c = float(center_t)
+                        start_t = max(0.5, t_c - 0.2)
+                        end_t = start_t + hold_s
+                        candidates.append((start_t, end_t, float(z)))
+            except Exception:
+                pass
+
+    if words:
+        for w in words:
+            w_start = getattr(w, "start", None) if hasattr(w, "start") else (w.get("start") if isinstance(w, dict) else None)
+            w_end = getattr(w, "end", None) if hasattr(w, "end") else (w.get("end") if isinstance(w, dict) else None)
+            w_text = getattr(w, "text", "") if hasattr(w, "text") else (w.get("text", "") if isinstance(w, dict) else "")
+            if w_start is None or w_end is None:
+                continue
+            w_start = float(w_start)
+            w_end = float(w_end)
+            txt = str(w_text).strip()
+            dur = w_end - w_start
+
+            is_emp = False
+            score = 1.0
+            if "!" in txt or "?" in txt:
+                is_emp = True
+                score = 2.0
+            elif txt.isupper() and len(txt) >= 3 and not txt.isdigit():
+                is_emp = True
+                score = 1.5
+            elif dur >= 0.45:
+                is_emp = True
+                score = 1.2
+
+            if is_emp and w_start >= 0.5:
+                start_t = max(0.5, w_start - 0.1)
+                end_t = start_t + max(hold_s, dur + 0.4)
+                candidates.append((start_t, end_t, score))
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda c: c[0])
+    clusters: List[List[Tuple[float, float, float]]] = []
+    current_cluster: List[Tuple[float, float, float]] = [candidates[0]]
+
+    for cand in candidates[1:]:
+        if cand[0] - current_cluster[-1][0] < min_gap_s:
+            current_cluster.append(cand)
+        else:
+            clusters.append(current_cluster)
+            current_cluster = [cand]
+    if current_cluster:
+        clusters.append(current_cluster)
+
+    selected: List[Tuple[float, float]] = []
+    last_end = -min_gap_s
+    for cluster in clusters:
+        best = max(cluster, key=lambda c: c[2])
+        if best[0] - last_end >= min_gap_s * 0.5:
+            selected.append((round(best[0], 2), round(best[1], 2)))
+            last_end = best[1]
+
+    return selected
+
+
 def enforce_centering_margin(
     crop_cx: np.ndarray,
     face_cx: np.ndarray,
-    crop_w: float,
+    crop_w: float | np.ndarray,
     max_deviation_ratio: float = 0.18
 ) -> np.ndarray:
     """
     Anti-Corner Framing Invariant:
     Guarantees that presenter's face never drifts farther than max_deviation_ratio
     from the crop center (e.g. +/- 18% of crop width).
-    Forces face to remain strictly within the safe central zone without ever
-    reaching the corner or border.
+    Forces face to remain strictly within the safe central zone [0.32, 0.68] of crop width
+    without ever reaching the corner or border.
     """
     n = len(crop_cx)
     if n == 0:
         return crop_cx
 
     max_dev = max_deviation_ratio * crop_w
+    is_arr = isinstance(max_dev, np.ndarray) and len(max_dev) == n
     adjusted_cx = crop_cx.copy()
 
     for i in range(n):
+        lim = float(max_dev[i]) if is_arr else float(max_dev)
         dev = face_cx[i] - adjusted_cx[i]
-        if abs(dev) > max_dev:
-            adjusted_cx[i] = face_cx[i] - np.sign(dev) * max_dev
+        if abs(dev) > lim:
+            adjusted_cx[i] = face_cx[i] - np.sign(dev) * lim
 
     # Two-pass soft clamp smoother to eliminate any abrupt boundary clamp edges
     smoothed = adjusted_cx.copy()
@@ -305,13 +499,20 @@ def enforce_centering_margin(
     for i in range(n - 2, -1, -1):
         smoothed[i] = 0.25 * smoothed[i] + 0.75 * smoothed[i + 1]
 
+    # Final guarantee clamp against zoomed crop width to enforce invariant strictly
+    for i in range(n):
+        lim = float(max_dev[i]) if is_arr else float(max_dev)
+        dev = face_cx[i] - smoothed[i]
+        if abs(dev) > lim:
+            smoothed[i] = face_cx[i] - np.sign(dev) * lim
+
     return smoothed
 
 
 def enforce_headroom_margin(
     crop_cy: np.ndarray,
     face_cy: np.ndarray,
-    crop_h: float,
+    crop_h: float | np.ndarray,
     target_headroom: float = 0.18,
     max_deviation: float = 0.12
 ) -> np.ndarray:
@@ -326,17 +527,26 @@ def enforce_headroom_margin(
 
     adjusted_cy = crop_cy.copy()
     max_dev = max_deviation * crop_h
+    is_arr = isinstance(max_dev, np.ndarray) and len(max_dev) == n
 
     for i in range(n):
+        lim = float(max_dev[i]) if is_arr else float(max_dev)
         dev = face_cy[i] - adjusted_cy[i]
-        if abs(dev) > max_dev:
-            adjusted_cy[i] = face_cy[i] - np.sign(dev) * max_dev
+        if abs(dev) > lim:
+            adjusted_cy[i] = face_cy[i] - np.sign(dev) * lim
 
     smoothed = adjusted_cy.copy()
     for i in range(1, n):
         smoothed[i] = 0.25 * adjusted_cy[i] + 0.75 * smoothed[i - 1]
     for i in range(n - 2, -1, -1):
         smoothed[i] = 0.25 * smoothed[i] + 0.75 * smoothed[i + 1]
+
+    # Final guarantee clamp against zoomed crop height
+    for i in range(n):
+        lim = float(max_dev[i]) if is_arr else float(max_dev)
+        dev = face_cy[i] - smoothed[i]
+        if abs(dev) > lim:
+            smoothed[i] = face_cy[i] - np.sign(dev) * lim
 
     return smoothed
 
@@ -385,6 +595,7 @@ class FaceReframer:
         self.aspect_ratio = getattr(config, "aspect_ratio", "9:16")
         self.detect_every = max(1, getattr(config, "detect_every", 3))
         self.detect_width = max(160, getattr(config, "detect_width", 320))
+        self.punch_in = getattr(config, "punch_in", "off")
         self.time_pass1: float = 0.0
         self.time_render: float = 0.0
         self.stage_timings: Dict[str, float] = {
@@ -392,7 +603,7 @@ class FaceReframer:
             "reframe render": 0.0,
         }
 
-    def plan(self) -> ReframePlan:
+    def plan(self, words: Optional[List] = None) -> ReframePlan:
         """
         Execute passes 1 to 2.7 of face reframing:
         - Face detection, motion analysis, scene-cut boundary detection.
@@ -691,29 +902,49 @@ class FaceReframer:
                 smoothed_cx[s_start:s_end] = smooth_trajectory(damp_cx, self.smooth_alpha)
                 smoothed_cy[s_start:s_end] = smooth_trajectory(damp_cy, self.smooth_alpha * 0.8)
 
+        # ---------------- PASS 2.6: Dynamic Punch-in Zoom Curve ----------------
+        if self.punch_in == "auto":
+            z_max = get_max_punch_in_zoom(height)
+            if self.config.punch_in_events is not None:
+                punch_events = self.config.punch_in_events
+            else:
+                words_to_use = words if words is not None else self.config.words
+                punch_events = detect_punch_in_events(
+                    media_path=src_path,
+                    words=words_to_use,
+                )
+            punch_curve = zoom_curve(num_frames, fps, punch_events, z_max=z_max, ramp=0.35)
+            total_zoom_arr = zoom * punch_curve
+            crop_w_arr = np.clip(base_crop_w / total_zoom_arr, 1.0, float(width)).astype(np.float32)
+            crop_h_arr = np.clip(base_crop_h / total_zoom_arr, 1.0, float(height)).astype(np.float32)
+            if len(punch_events) > 0:
+                print(f"[reframe] Punch-in zoom enabled: {len(punch_events)} event(s), z_max={z_max:.2f}x (height={height}p)")
+        else:
+            punch_curve = np.ones(num_frames, dtype=np.float32)
+            total_zoom_arr = np.full(num_frames, zoom, dtype=np.float32)
+            crop_w_arr = np.full(num_frames, float(crop_w), dtype=np.float32)
+            crop_h_arr = np.full(num_frames, float(crop_h), dtype=np.float32)
+
         # ---------------- PASS 2.7: Anti-Corner & Upper-Third Headroom Framing Invariants ----------------
         # 1. Horizontal centering safe-band: presenter's face never strays farther than 18% of crop width from center
         centered_cx = enforce_centering_margin(
             crop_cx=smoothed_cx,
             face_cx=interpolated_cx,
-            crop_w=float(crop_w),
+            crop_w=crop_w_arr,
             max_deviation_ratio=0.18
         )
-        crop_x0 = np.clip(centered_cx - crop_w / 2.0, 0.0, float(width - crop_w))
+        crop_x0 = np.clip(centered_cx - crop_w_arr / 2.0, 0.0, float(width) - crop_w_arr)
 
         # 2. Vertical headroom safe-band: keeps eyes in upper third without hitting top or captions
-        if crop_h < height:
-            centered_cy = enforce_headroom_margin(
-                crop_cy=smoothed_cy,
-                face_cy=interpolated_cy,
-                crop_h=float(crop_h),
-                target_headroom=self.headroom,
-                max_deviation=0.12
-            )
-            target_crop_y = centered_cy - self.headroom * crop_h
-            crop_y0 = np.clip(target_crop_y, 0.0, float(height - crop_h))
-        else:
-            crop_y0 = np.zeros(num_frames, dtype=np.float32)
+        centered_cy = enforce_headroom_margin(
+            crop_cy=smoothed_cy,
+            face_cy=interpolated_cy,
+            crop_h=crop_h_arr,
+            target_headroom=self.headroom,
+            max_deviation=0.12
+        )
+        target_crop_y = centered_cy - self.headroom * crop_h_arr
+        crop_y0 = np.clip(target_crop_y, 0.0, float(height) - crop_h_arr)
 
         # Optional CSV keyframes export
         if self.config.csv_path:
@@ -728,8 +959,8 @@ class FaceReframer:
                         round(i / fps, 4),
                         round(float(crop_x0[i]), 2),
                         round(float(crop_y0[i]), 2),
-                        crop_w,
-                        crop_h,
+                        round(float(crop_w_arr[i]), 1),
+                        round(float(crop_h_arr[i]), 1),
                         1 if i in cut_indices else 0
                     ])
             print(f"[reframe] Exported crop keyframes to: {csv_file}")
@@ -766,6 +997,9 @@ class FaceReframer:
             lock_pct=lock_pct,
             num_valid_faces=num_valid,
             detect_every=detect_every,
+            crop_w_arr=crop_w_arr,
+            crop_h_arr=crop_h_arr,
+            zoom_curve=total_zoom_arr,
         )
 
     def render(self, plan: Optional[ReframePlan] = None, fast: bool = False) -> Path:
@@ -821,10 +1055,10 @@ class FaceReframer:
             print(f"[reframe] Encoding {scale_desc} direct-crop video via FFmpeg pipe -> {out_path}")
             ffmpeg_cmd = [
                 "ffmpeg", "-y", "-loglevel", "error",
-                "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{crop_w}x{crop_h}", "-r", f"{fps}", "-i", "-",
+                "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{out_canvas_w}x{out_canvas_h}", "-r", f"{fps}", "-i", "-",
                 "-i", str(src_path),
                 "-map", "0:v", "-map", "1:a:0",
-                "-vf", f"scale={out_canvas_w}:{out_canvas_h}:flags=lanczos,format=yuv420p",
+                "-vf", "format=yuv420p",
                 "-af", "asetpts=PTS-STARTPTS,aresample=async=1000:first_pts=0",
                 "-fps_mode", "cfr",
             ]
@@ -858,10 +1092,27 @@ class FaceReframer:
                 ok, frame = cap.read()
                 if not ok:
                     break
-                affine_matrix = np.float32([[1, 0, -crop_x0[t]], [0, 1, -crop_y0[t]]])
-                cropped_frame = cv2.warpAffine(frame, affine_matrix, (crop_w, crop_h), flags=cv2.INTER_LINEAR)
-                if proc.stdin:
-                    proc.stdin.write(cropped_frame.tobytes())
+                x0 = float(crop_x0[t]) if t < len(crop_x0) else float(crop_x0[-1])
+                y0 = float(crop_y0[t]) if t < len(crop_y0) else float(crop_y0[-1])
+                w_t = float(plan.crop_w_arr[t]) if plan.crop_w_arr is not None else float(crop_w)
+                h_t = float(plan.crop_h_arr[t]) if plan.crop_h_arr is not None else float(crop_h)
+
+                if plan.layout == "blur-bw":
+                    affine_matrix = np.float32([[1, 0, -x0], [0, 1, -y0]])
+                    cropped_frame = cv2.warpAffine(frame, affine_matrix, (crop_w, crop_h), flags=cv2.INTER_LINEAR)
+                    if proc.stdin:
+                        proc.stdin.write(cropped_frame.tobytes())
+                else:
+                    # Single fused crop + scale warp directly to final canvas size
+                    sx = float(out_canvas_w) / w_t
+                    sy = float(out_canvas_h) / h_t
+                    M = np.float32([
+                        [sx, 0, -sx * x0],
+                        [0, sy, -sy * y0]
+                    ])
+                    warped_frame = cv2.warpAffine(frame, M, (out_canvas_w, out_canvas_h), flags=cv2.INTER_CUBIC)
+                    if proc.stdin:
+                        proc.stdin.write(warped_frame.tobytes())
 
                 if debug_writer is not None:
                     vis = frame.copy()
@@ -870,14 +1121,16 @@ class FaceReframer:
                             color = (0, 0, 255) if is_static_detection(dx, dy) else (0, 255, 0)
                             cv2.rectangle(vis, (int(dx - dw / 2), int(dy - dh / 2)),
                                           (int(dx + dw / 2), int(dy + dh / 2)), color, 2)
-                    x0, y0 = int(crop_x0[t]), int(crop_y0[t])
-                    cv2.rectangle(vis, (x0, y0), (x0 + crop_w, y0 + crop_h), (255, 200, 0), 2)
+                    x0_i, y0_i = int(round(x0)), int(round(y0))
+                    cw_i, ch_i = int(round(w_t)), int(round(h_t))
+                    cv2.rectangle(vis, (x0_i, y0_i), (x0_i + cw_i, y0_i + ch_i), (255, 200, 0), 2)
                     # Upper-third eyeline guideline
-                    eyeline_y = int(y0 + self.headroom * crop_h)
-                    cv2.line(vis, (x0, eyeline_y), (x0 + crop_w, eyeline_y), (0, 255, 255), 1)
+                    eyeline_y = int(round(y0_i + self.headroom * ch_i))
+                    cv2.line(vis, (x0_i, eyeline_y), (x0_i + cw_i, eyeline_y), (0, 255, 255), 1)
                     # HUD overlay
                     is_cut = t in cut_indices
-                    cv2.putText(vis, f"Preset: {self.preset_name} | Zoom: {zoom:.2f}x | Cut: {is_cut}", (20, 40),
+                    z_val = float(plan.zoom_curve[t]) if plan.zoom_curve is not None else zoom
+                    cv2.putText(vis, f"Preset: {self.preset_name} | Zoom: {z_val:.2f}x | Cut: {is_cut}", (20, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                     debug_writer.write(vis)
         finally:
@@ -949,6 +1202,7 @@ def reframe_video(
     fast: bool = False,
     detect_every: int = 3,
     detect_width: int = 320,
+    punch_in: str = "off",
 ) -> Path:
     """Convenience functional interface for video reframing."""
     config = ReframeConfig(
@@ -971,6 +1225,7 @@ def reframe_video(
         audio_delay_ms=audio_delay_ms,
         detect_every=detect_every,
         detect_width=detect_width,
+        punch_in=punch_in,
     )
     reframer = FaceReframer(config)
     return reframer.run(fast=fast)
