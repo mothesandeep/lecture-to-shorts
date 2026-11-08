@@ -71,144 +71,182 @@ def refine_clip_boundaries(
     print(f"\n[boundary] High-Precision Boundary Re-verification (+/- {margin_s:.0f}s window)...")
     print(f"[boundary] Probing audio context [{format_timestamp_ms(window_start)} -> {format_timestamp_ms(window_end)}] ({window_dur:.1f}s)...")
 
-    # 1. Extract lightweight mono audio snippet for the window
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-        tmp_audio = Path(tmp.name)
+    # 1. First try to build word boundaries from full-lecture transcript cache (zero latency)
+    from core.whisper_backend import load_lecture_transcript_cache, transcribe_words
 
-    try:
-        ffmpeg_cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-ss", f"{window_start:.3f}",
-            "-t", f"{window_dur:.3f}",
-            "-i", str(v_path),
-            "-vn",
-            "-ar", "16000",
-            "-ac", "1",
-            "-c:a", "libmp3lame",
-            "-q:a", "4",
-            str(tmp_audio)
+    words: List[Dict[str, Any]] = []
+    cached = load_lecture_transcript_cache(v_path, whisper_model)
+
+    if cached and cached.get("words"):
+        cached_words = cached["words"]
+        cached_segs = cached.get("segments", [])
+        words_in_ctx = [
+            w for w in cached_words
+            if w.end > (window_start + 0.05) and w.start < (window_end - 0.05)
         ]
-        res = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            print(f"[boundary] Audio extraction failed: {res.stderr} -> using original timestamps.")
-            return start_t, end_t
+        coverage_ok = True
+        if cached_segs:
+            expected_speech = sum(
+                max(0.0, min(float(s.get("end", 0.0)), window_end) - max(float(s.get("start", 0.0)), window_start))
+                for s in cached_segs
+                if float(s.get("end", 0.0)) > window_start and float(s.get("start", 0.0)) < window_end
+            )
+            if expected_speech > 2.0:
+                actual_speech = sum(
+                    max(0.0, min(w.end, window_end) - max(w.start, window_start))
+                    for w in words_in_ctx
+                )
+                if (actual_speech / expected_speech) < 0.80:
+                    coverage_ok = False
 
-        # 2. Fast Whisper word-level pass on the 2-3 minute audio chunk
-        from core.whisper_backend import transcribe_words
-        trans_res = transcribe_words(
-            audio_path=tmp_audio,
-            language="hi",
-            model=whisper_model,
-            backend=backend,
-            word_timestamps=True,
-            condition_on_previous_text=False,
-            no_speech_threshold=0.3,
-            fp16=False
-        )
+        if words_in_ctx and coverage_ok:
+            words = [
+                {
+                    "word": w.text,
+                    "start": w.start,
+                    "end": w.end
+                }
+                for w in words_in_ctx
+            ]
+            print(f"[boundary] Sliced {len(words)} words from full-lecture cache (bypassing boundary Whisper pass).")
 
-        # 3. Collect word timestamps shifted to global video timeline
-        words: List[Dict[str, Any]] = [
-            {
-                "word": w.text,
-                "start": window_start + w.start,
-                "end": window_start + w.end
-            }
-            for w in trans_res.words
-        ]
-        terminal_puncts = {".", "!", "?", "।", "॥"}
+    # 2. Fall back to fresh Whisper pass on audio window if cache missing or poor coverage (<80%)
+    if not words:
+        print("[boundary] Cache missing or low coverage (<80%) -> falling back to fresh audio window Whisper pass...")
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            tmp_audio = Path(tmp.name)
 
-        if not words:
-            print("[boundary] No speech detected in boundary window -> retaining original timestamps.")
-            return start_t, end_t
+        try:
+            ffmpeg_cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-ss", f"{window_start:.3f}",
+                "-t", f"{window_dur:.3f}",
+                "-i", str(v_path),
+                "-vn",
+                "-ar", "16000",
+                "-ac", "1",
+                "-c:a", "libmp3lame",
+                "-q:a", "4",
+                str(tmp_audio)
+            ]
+            res = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                print(f"[boundary] Audio extraction failed: {res.stderr} -> using original timestamps.")
+                return start_t, end_t
 
-        # 4. Snap Starting Boundary
-        # Look for natural sentence starts within [start_t - 15.0, start_t + 8.0]
-        start_candidates: List[Dict[str, Any]] = []
+            trans_res = transcribe_words(
+                audio_path=tmp_audio,
+                language="hi",
+                model=whisper_model,
+                backend=backend,
+                word_timestamps=True,
+                condition_on_previous_text=False,
+                no_speech_threshold=0.3,
+                fp16=False
+            )
 
-        for i, w in enumerate(words):
-            # Check if this word could be a sentence start
-            w_start = w["start"]
-            if w_start < start_t - 18.0 or w_start > start_t + 10.0:
-                continue
+            words = [
+                {
+                    "word": w.text,
+                    "start": window_start + w.start,
+                    "end": window_start + w.end
+                }
+                for w in trans_res.words
+            ]
+        finally:
+            if tmp_audio.exists():
+                tmp_audio.unlink(missing_ok=True)
+    # 3. Apply snapping logic using global words
+    terminal_puncts = {".", "!", "?", "।", "॥"}
 
-            pause_before = 999.0 if i == 0 else (w_start - words[i - 1]["end"])
-            prev_ended_sentence = (i > 0) and any(words[i - 1]["word"].endswith(p) for p in terminal_puncts)
+    if not words:
+        print("[boundary] No speech detected in boundary window -> retaining original timestamps.")
+        return start_t, end_t
 
-            is_sentence_start = (pause_before >= 0.30) or prev_ended_sentence or (i == 0)
+    # 4. Snap Starting Boundary
+    # Look for natural sentence starts within [start_t - 15.0, start_t + 8.0]
+    start_candidates: List[Dict[str, Any]] = []
 
-            # Score candidate: prefer natural pause closest to start_t without cutting speech
-            if is_sentence_start:
-                if w_start <= start_t:
-                    dist_penalty = (start_t - w_start) * 0.7  # Small penalty for slight lead-in
-                else:
-                    dist_penalty = (w_start - start_t) * 1.6  # Heavier penalty for clipping hook
+    for i, w in enumerate(words):
+        # Check if this word could be a sentence start
+        w_start = w["start"]
+        if w_start < start_t - 18.0 or w_start > start_t + 10.0:
+            continue
 
-                pause_bonus = -min(2.0, pause_before * 1.5) if pause_before < 10.0 else -1.0
-                score = dist_penalty + pause_bonus
-                start_candidates.append({
-                    "start": max(0.0, w_start - 0.12),  # 120ms buffer for plosive consonants
-                    "score": score,
-                    "word": w["word"]
-                })
+        pause_before = 999.0 if i == 0 else (w_start - words[i - 1]["end"])
+        prev_ended_sentence = (i > 0) and any(words[i - 1]["word"].endswith(p) for p in terminal_puncts)
 
-        if start_candidates:
-            start_candidates.sort(key=lambda c: c["score"])
-            refined_start = round(start_candidates[0]["start"], 2)
-        else:
-            # If no clear sentence break, snap to closest word start
-            closest_word = min(words, key=lambda w: abs(w["start"] - start_t))
-            refined_start = round(max(0.0, closest_word["start"] - 0.10), 2)
+        is_sentence_start = (pause_before >= 0.30) or prev_ended_sentence or (i == 0)
 
-        # 5. Snap Ending Boundary
-        # Look for natural punchline / sentence completion in [end_t - 8.0, end_t + 15.0]
-        end_candidates: List[Dict[str, Any]] = []
+        # Score candidate: prefer natural pause closest to start_t without cutting speech
+        if is_sentence_start:
+            if w_start <= start_t:
+                dist_penalty = (start_t - w_start) * 0.7  # Small penalty for slight lead-in
+            else:
+                dist_penalty = (w_start - start_t) * 1.6  # Heavier penalty for clipping hook
 
-        for i, w in enumerate(words):
-            w_end = w["end"]
-            if w_end < end_t - 10.0 or w_end > end_t + 18.0:
-                continue
+            pause_bonus = -min(2.0, pause_before * 1.5) if pause_before < 10.0 else -1.0
+            score = dist_penalty + pause_bonus
+            start_candidates.append({
+                "start": max(0.0, w_start - 0.12),  # 120ms buffer for plosive consonants
+                "score": score,
+                "word": w["word"]
+            })
 
-            pause_after = 999.0 if i == len(words) - 1 else (words[i + 1]["start"] - w_end)
-            ends_sentence = any(w["word"].endswith(p) for p in terminal_puncts)
+    if start_candidates:
+        start_candidates.sort(key=lambda c: c["score"])
+        refined_start = round(start_candidates[0]["start"], 2)
+    else:
+        # If no clear sentence break, snap to closest word start
+        closest_word = min(words, key=lambda w: abs(w["start"] - start_t))
+        refined_start = round(max(0.0, closest_word["start"] - 0.10), 2)
 
-            is_sentence_end = (pause_after >= 0.35) or ends_sentence or (i == len(words) - 1)
+    # 5. Snap Ending Boundary
+    # Look for natural punchline / sentence completion in [end_t - 8.0, end_t + 15.0]
+    end_candidates: List[Dict[str, Any]] = []
 
-            if is_sentence_end:
-                if w_end >= end_t:
-                    dist_penalty = (w_end - end_t) * 0.7  # Small penalty for allowing punchline resolution
-                else:
-                    dist_penalty = (end_t - w_end) * 1.5  # Heavier penalty for premature cut
+    for i, w in enumerate(words):
+        w_end = w["end"]
+        if w_end < end_t - 10.0 or w_end > end_t + 18.0:
+            continue
 
-                pause_bonus = -min(2.0, pause_after * 1.5) if pause_after < 10.0 else -1.0
-                score = dist_penalty + pause_bonus
-                end_candidates.append({
-                    "end": min(total_dur, w_end + 0.18),  # 180ms buffer for natural breath decay
-                    "score": score,
-                    "word": w["word"]
-                })
+        pause_after = 999.0 if i == len(words) - 1 else (words[i + 1]["start"] - w_end)
+        ends_sentence = any(w["word"].endswith(p) for p in terminal_puncts)
 
-        if end_candidates:
-            end_candidates.sort(key=lambda c: c["score"])
-            refined_end = round(end_candidates[0]["end"], 2)
-        else:
-            # If no clear break, snap to closest word end
-            closest_word = min(words, key=lambda w: abs(w["end"] - end_t))
-            refined_end = round(min(total_dur, closest_word["end"] + 0.15), 2)
+        is_sentence_end = (pause_after >= 0.35) or ends_sentence or (i == len(words) - 1)
 
-        # Enforce sanity minimum duration
-        if refined_end <= refined_start + 5.0:
-            refined_start = start_t
-            refined_end = end_t
+        if is_sentence_end:
+            if w_end >= end_t:
+                dist_penalty = (w_end - end_t) * 0.7  # Small penalty for allowing punchline resolution
+            else:
+                dist_penalty = (end_t - w_end) * 1.5  # Heavier penalty for premature cut
 
-        diff_s = (refined_end - refined_start) - (end_t - start_t)
-        sign = "+" if diff_s >= 0 else ""
-        print(f"[boundary] Refined cut from [{format_timestamp_ms(start_t)} -> {format_timestamp_ms(end_t)}] to "
-              f"[{format_timestamp_ms(refined_start)} -> {format_timestamp_ms(refined_end)}] "
-              f"({sign}{diff_s:.1f}s boundary adjusted for natural sentence completion)")
+            pause_bonus = -min(2.0, pause_after * 1.5) if pause_after < 10.0 else -1.0
+            score = dist_penalty + pause_bonus
+            end_candidates.append({
+                "end": min(total_dur, w_end + 0.18),  # 180ms buffer for natural breath decay
+                "score": score,
+                "word": w["word"]
+            })
 
-        return refined_start, refined_end
+    if end_candidates:
+        end_candidates.sort(key=lambda c: c["score"])
+        refined_end = round(end_candidates[0]["end"], 2)
+    else:
+        # If no clear break, snap to closest word end
+        closest_word = min(words, key=lambda w: abs(w["end"] - end_t))
+        refined_end = round(min(total_dur, closest_word["end"] + 0.15), 2)
 
-    finally:
-        if tmp_audio.exists():
-            tmp_audio.unlink(missing_ok=True)
+    # Enforce sanity minimum duration
+    if refined_end <= refined_start + 5.0:
+        refined_start = start_t
+        refined_end = end_t
+
+    diff_s = (refined_end - refined_start) - (end_t - start_t)
+    sign = "+" if diff_s >= 0 else ""
+    print(f"[boundary] Refined cut from [{format_timestamp_ms(start_t)} -> {format_timestamp_ms(end_t)}] to "
+          f"[{format_timestamp_ms(refined_start)} -> {format_timestamp_ms(refined_end)}] "
+          f"({sign}{diff_s:.1f}s boundary adjusted for natural sentence completion)")
+
+    return refined_start, refined_end
 

@@ -32,7 +32,12 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from core.whisper_backend import transcribe_words
+from core.transcriber import DEFAULT_WHISPER_INITIAL_PROMPT
+from core.whisper_backend import (
+    load_lecture_transcript_cache,
+    save_lecture_transcript_cache,
+    transcribe_words,
+)
 
 try:
     from core.av_sync import cut_snippet_accurate, ensure_cfr_video, probe_av_sync, verify_av_sync
@@ -174,27 +179,23 @@ class HookFinder:
         """
         Transcribe the full audio of the video using Whisper,
         utilizing sha256 disk caching for instant subsequent loads.
+        Stores both segment-level and word-level timestamps in the disk cache.
         """
-        import whisper
-
         v_path = Path(video_path).expanduser().resolve()
-        file_stat = v_path.stat()
-        cache_key_data = f"{v_path.name}_{file_stat.st_size}_{file_stat.st_mtime}_{self.whisper_model_name}"
-        cache_hash = hashlib.sha256(cache_key_data.encode("utf-8")).hexdigest()[:24]
-        cache_file = CACHE_DIR / f"transcript_{cache_hash}.json"
 
-        if cache_file.exists():
-            try:
-                cached_data = json.loads(cache_file.read_text(encoding="utf-8"))
-                # Invalidate if cached transcript contains Urdu / Perso-Arabic script
-                if any(URDU_RE.search(s.get("text", "")) for s in cached_data):
-                    print(f"[hook_finder] Cached transcript contains Urdu script -> invalidating cache to re-transcribe in clean Hindi/Hinglish.")
-                else:
-                    print(f"[hook_finder] Loaded full lecture transcript from cache: {cache_file.name} "
-                          f"({len(cached_data)} segments)")
-                    return cached_data
-            except Exception:
-                pass
+        # 1. Try loading from full lecture disk cache
+        cached = load_lecture_transcript_cache(v_path, self.whisper_model_name)
+        if cached:
+            segments = cached.get("segments", [])
+            words = cached.get("words", [])
+            if segments and words:
+                print(
+                    f"[hook_finder] Loaded full lecture transcript from cache: "
+                    f"{len(segments)} segments, {len(words)} words"
+                )
+                return segments
+            elif segments:
+                print(f"[hook_finder] Cached transcript lacks word timestamps -> re-transcribing to cache words...")
 
         print(f"[hook_finder] Extracting audio from {v_path.name}...")
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_audio:
@@ -202,18 +203,15 @@ class HookFinder:
 
         try:
             extract_audio(v_path, tmp_audio_path)
-            print(f"[hook_finder] Transcribing full audio with Whisper model '{self.whisper_model_name}' (backend={self.backend})...")
-            whisper_prompt = (
-                "यह एक हिंदी और हिंग्लिश क्लास लेक्चर वीडियो है जिसमें शिक्षक पढ़ा रहे हैं। "
-                "Ye ek Hindi Hinglish lecture video hai jisme teacher concepts aur motivation samjha rahe hain."
-            )
+            print(f"[hook_finder] Transcribing full audio with Whisper model '{self.whisper_model_name}' (backend={self.backend}, word_timestamps=True)...")
+            whisper_prompt = DEFAULT_WHISPER_INITIAL_PROMPT
             trans_res = transcribe_words(
                 audio_path=tmp_audio_path,
                 language="hi",
                 model=self.whisper_model_name,
                 initial_prompt=whisper_prompt,
                 backend=self.backend,
-                word_timestamps=False,
+                word_timestamps=True,
                 condition_on_previous_text=False,
                 fp16=False
             )
@@ -229,10 +227,18 @@ class HookFinder:
                 if s.get("text", "").strip()
             ]
 
-            # Save to disk cache if segments found
+            # Save full transcript with word-level timestamps to disk cache
             if segments:
-                cache_file.write_text(json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"[hook_finder] Transcription completed ({len(segments)} segments) and cached -> {cache_file.name}")
+                cache_file = save_lecture_transcript_cache(
+                    video_path=v_path,
+                    model_name=self.whisper_model_name,
+                    segments=segments,
+                    words=trans_res.words
+                )
+                print(
+                    f"[hook_finder] Transcription completed ({len(segments)} segments, {len(trans_res.words)} words) "
+                    f"and cached -> {cache_file.name}"
+                )
             return segments
         finally:
             tmp_audio_path.unlink(missing_ok=True)

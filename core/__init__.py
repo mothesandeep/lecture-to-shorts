@@ -46,7 +46,14 @@ from core.whisper_backend import (
     HAS_MLX_WHISPER,
     TranscriptionResult,
     Word,
+    compute_lecture_cache_key,
+    get_lecture_cache_path,
     get_whisper_model,
+    load_lecture_transcript_cache,
+    map_timestamp_to_clip,
+    map_word_to_clip,
+    save_lecture_transcript_cache,
+    slice_cached_words_for_clip,
     transcribe_words,
 )
 
@@ -86,5 +93,12 @@ __all__ = [
     "transcribe_words",
     "get_whisper_model",
     "HAS_MLX_WHISPER",
+    "compute_lecture_cache_key",
+    "get_lecture_cache_path",
+    "save_lecture_transcript_cache",
+    "load_lecture_transcript_cache",
+    "map_timestamp_to_clip",
+    "map_word_to_clip",
+    "slice_cached_words_for_clip",
 ]
 

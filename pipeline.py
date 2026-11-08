@@ -272,7 +272,11 @@ def process_single_clip(
             backend=whisper_backend,
         )
         words = transcriber.transcribe_and_romanize(
-            video_path=active_video_path
+            video_path=active_video_path,
+            src_lecture_video=src_video,
+            clip_start=clip_info.start_time,
+            clip_end=clip_info.end_time,
+            audio_delay_ms=audio_delay_ms,
         )
         time_whisper = getattr(transcriber, "time_whisper", 0.0)
         time_romanize = getattr(transcriber, "time_romanize", 0.0)

@@ -27,7 +27,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from core.whisper_backend import transcribe_words
+from core.whisper_backend import (
+    load_lecture_transcript_cache,
+    slice_cached_words_for_clip,
+    transcribe_words,
+)
 
 # ----------------- Strict Latin & Alphabet Constants -----------------
 DEV = re.compile(r"[\u0900-\u097F]")
@@ -435,43 +439,83 @@ class HinglishTranscriber:
         video_path: Path | str,
         glossary: str = "",
         script_hint: str = "",
-        whisper_prompt: Optional[str] = None
+        whisper_prompt: Optional[str] = None,
+        src_lecture_video: Optional[Path | str] = None,
+        clip_start: Optional[float] = None,
+        clip_end: Optional[float] = None,
+        audio_delay_ms: float = 500.0,
     ) -> List[WordCaption]:
         """
         Transcribe video audio using Whisper with word timestamps,
         then romanize Devanagari tokens to Hinglish.
         Guarantees 100% Latin ASCII words.
+
+        If src_lecture_video and clip_start are provided, attempts to build words
+        by slicing from the full-lecture transcript cache (with coverage check >= 80%).
+        Falls back to fresh Whisper pass if cache is missing or coverage is low.
         """
         path_obj = Path(video_path).expanduser().resolve()
         if not path_obj.is_file():
             raise FileNotFoundError(f"Video file not found: {path_obj}")
 
-        prompt = whisper_prompt.strip() if whisper_prompt else DEFAULT_WHISPER_INITIAL_PROMPT
-        if glossary and glossary.strip():
-            prompt = f"{prompt} Key terms: {glossary.strip()}"
+        raw_words: List[Dict[str, Any]] = []
 
-        t_whisper_start = time.time()
-        print(f"[transcribe] Transcribing audio with word-level timestamps from: {path_obj.name} (model={self.whisper_model_name}, backend={self.backend})...")
-        trans_res = transcribe_words(
-            audio_path=path_obj,
-            language="hi",
-            model=self.whisper_model_name,
-            initial_prompt=prompt,
-            backend=self.backend,
-            word_timestamps=True,
-            condition_on_previous_text=False,
-            no_speech_threshold=0.3,
-            fp16=False
-        )
+        # 1. Try to build words from full-lecture transcript cache by slicing
+        if src_lecture_video and clip_start is not None and clip_end is not None:
+            cached = load_lecture_transcript_cache(src_lecture_video, self.whisper_model_name)
+            if cached and cached.get("words"):
+                sliced = slice_cached_words_for_clip(
+                    cached_words=cached["words"],
+                    clip_start=clip_start,
+                    clip_end=clip_end,
+                    audio_delay_ms=audio_delay_ms,
+                    cached_segments=cached.get("segments", []),
+                    min_coverage=0.80,
+                )
+                if sliced:
+                    raw_words = [
+                        {"word": w.text, "start": w.start, "end": w.end}
+                        for w in sliced
+                    ]
+                    self.time_whisper = 0.0
+                    self.stage_timings["whisper"] = 0.0
+                    print(
+                        f"[transcribe] Sliced {len(raw_words)} words from full-lecture cache "
+                        f"(orig [{clip_start:.2f}s -> {clip_end:.2f}s], audio_delay={audio_delay_ms:.0f}ms). "
+                        f"Bypassing Whisper pass!"
+                    )
 
-        raw_words: List[Dict[str, Any]] = [
-            {"word": w.text, "start": w.start, "end": w.end}
-            for w in trans_res.words
-        ]
+        # 2. Fall back to fresh Whisper pass if cache is missing or low coverage
+        if not raw_words:
+            if src_lecture_video:
+                print("[transcribe] Cache missing or low coverage (<80%) -> running fresh Whisper pass on clip audio...")
+            prompt = whisper_prompt.strip() if whisper_prompt else DEFAULT_WHISPER_INITIAL_PROMPT
+            if glossary and glossary.strip():
+                prompt = f"{prompt} Key terms: {glossary.strip()}"
+
+            t_whisper_start = time.time()
+            print(f"[transcribe] Transcribing audio with word-level timestamps from: {path_obj.name} (model={self.whisper_model_name}, backend={self.backend})...")
+            trans_res = transcribe_words(
+                audio_path=path_obj,
+                language="hi",
+                model=self.whisper_model_name,
+                initial_prompt=prompt,
+                backend=self.backend,
+                word_timestamps=True,
+                condition_on_previous_text=False,
+                no_speech_threshold=0.3,
+                fp16=False
+            )
+
+            raw_words = [
+                {"word": w.text, "start": w.start, "end": w.end}
+                for w in trans_res.words
+            ]
+            self.time_whisper = time.time() - t_whisper_start
+            self.stage_timings["whisper"] = self.time_whisper
+
         tokens = [w["word"] for w in raw_words]
         total_tokens = len(tokens)
-        self.time_whisper = time.time() - t_whisper_start
-        self.stage_timings["whisper"] = self.time_whisper
         print(f"[romanize] Transcribed {total_tokens} words. Processing Hinglish transliteration...")
 
         t_gemini_start = time.time()

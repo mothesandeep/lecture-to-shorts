@@ -17,12 +17,20 @@ Provides:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+CACHE_DIR = Path.home() / ".cache" / "hinglish_captions"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+URDU_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
 
 
 @dataclass
@@ -255,3 +263,228 @@ def transcribe_words(
 
     full_text = raw_result.get("text", "").strip()
     return TranscriptionResult(words=words, segments=segments, text=full_text)
+
+
+# ── Full-Lecture Disk Cache & Slicing Engine ─────────────────────────────────
+
+def compute_lecture_cache_key(video_path: Path | str, model_name: str) -> str:
+    """
+    Compute sha256 cache key based on filename + size + mtime + model.
+    """
+    v_path = Path(video_path).expanduser().resolve()
+    stat = v_path.stat()
+    raw_key = f"{v_path.name}_{stat.st_size}_{stat.st_mtime}_{model_name}"
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:24]
+
+
+def get_lecture_cache_path(video_path: Path | str, model_name: str) -> Path:
+    """
+    Return destination path for full-lecture transcript disk cache.
+    """
+    cache_hash = compute_lecture_cache_key(video_path, model_name)
+    return CACHE_DIR / f"transcript_{cache_hash}.json"
+
+
+def save_lecture_transcript_cache(
+    video_path: Path | str,
+    model_name: str,
+    segments: List[Dict[str, Any]],
+    words: List[Word],
+) -> Path:
+    """
+    Save full-lecture transcript with both segments and word-level timestamps.
+    """
+    v_path = Path(video_path).expanduser().resolve()
+    stat = v_path.stat()
+    cache_file = get_lecture_cache_path(v_path, model_name)
+
+    data = {
+        "version": 2,
+        "video": v_path.name,
+        "size": stat.st_size,
+        "mtime": stat.st_mtime,
+        "model": model_name,
+        "segments": segments,
+        "words": [
+            {
+                "word": w.text,
+                "start": round(w.start, 3),
+                "end": round(w.end, 3),
+            }
+            for w in words
+        ],
+    }
+    cache_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    return cache_file
+
+
+def load_lecture_transcript_cache(
+    video_path: Path | str,
+    model_name: Optional[str] = None,
+    allow_fallback_models: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """
+    Load full-lecture transcript cache for a video.
+    If model_name is provided and allow_fallback_models is False, checks only that model.
+    If model_name is None or allow_fallback_models is True, searches other standard models.
+    Returns None if cache is missing, corrupted, or contains Urdu script.
+    """
+    v_path = Path(video_path).expanduser().resolve()
+    if not v_path.is_file():
+        return None
+
+    models_to_try: List[str] = []
+    if model_name:
+        models_to_try.append(model_name)
+    if not model_name or allow_fallback_models:
+        for m in ["large-v3", "base", "turbo", "small", "medium", "large-v3-turbo"]:
+            if m not in models_to_try:
+                models_to_try.append(m)
+
+    for m in models_to_try:
+        cache_file = get_lecture_cache_path(v_path, m)
+        if not cache_file.exists():
+            continue
+        try:
+            raw_data = json.loads(cache_file.read_text(encoding="utf-8"))
+            if isinstance(raw_data, list):
+                # Legacy version 1 cache (segments only)
+                segments = raw_data
+                word_dicts = []
+                cached_model = m
+            elif isinstance(raw_data, dict):
+                segments = raw_data.get("segments", [])
+                word_dicts = raw_data.get("words", [])
+                cached_model = raw_data.get("model", m)
+            else:
+                continue
+
+            # Invalidate if cached transcript contains Urdu script
+            if any(URDU_RE.search(s.get("text", "")) for s in segments):
+                continue
+
+            words = [
+                Word(
+                    start=float(w.get("start", 0.0)),
+                    end=float(w.get("end", 0.0)),
+                    text=str(w.get("word", "")).strip(),
+                )
+                for w in word_dicts
+                if str(w.get("word", "")).strip()
+            ]
+
+            return {
+                "segments": segments,
+                "words": words,
+                "model": cached_model,
+                "cache_file": str(cache_file),
+            }
+        except Exception:
+            continue
+
+    return None
+
+
+def map_timestamp_to_clip(
+    orig_t: float,
+    clip_start: float,
+    audio_delay_ms: float = 500.0,
+) -> float:
+    """
+    Time mapping for the final clip:
+    final_t = orig_t - clip_start + audio_delay_s
+    (audio_delay_s = audio_delay_ms / 1000, because the final audio is delayed).
+    """
+    audio_delay_s = audio_delay_ms / 1000.0
+    return orig_t - clip_start + audio_delay_s
+
+
+def map_word_to_clip(
+    word: Word,
+    clip_start: float,
+    audio_delay_ms: float = 500.0,
+) -> Word:
+    """
+    Map Word timestamps from original lecture video to final cut clip timeline:
+    final_t = orig_t - clip_start + audio_delay_s
+    """
+    audio_delay_s = audio_delay_ms / 1000.0
+    new_start = round(word.start - clip_start + audio_delay_s, 3)
+    new_end = round(word.end - clip_start + audio_delay_s, 3)
+    return Word(start=new_start, end=new_end, text=word.text)
+
+
+def slice_cached_words_for_clip(
+    cached_words: List[Word],
+    clip_start: float,
+    clip_end: float,
+    audio_delay_ms: float = 500.0,
+    cached_segments: Optional[List[Dict[str, Any]]] = None,
+    min_coverage: float = 0.80,
+) -> Optional[List[Word]]:
+    """
+    Slice full-lecture cached words for the given clip window [clip_start, clip_end]
+    and map timestamps to the final clip timeline.
+
+    Returns:
+        List[Word] mapped to clip timeline if word coverage in slice >= min_coverage.
+        None if cache is missing, empty, or word coverage < min_coverage (triggering
+        fallback to a fresh Whisper pass).
+    """
+    if not cached_words:
+        return None
+
+    # Filter words overlapping the clip slice
+    words_in_window = [
+        w for w in cached_words
+        if w.end > (clip_start + 0.05) and w.start < (clip_end - 0.05)
+    ]
+
+    if not words_in_window:
+        return None
+
+    # Coverage verification against expected speech in the slice (Requirement 3)
+    if cached_segments:
+        expected_words = 0.0
+        for s in cached_segments:
+            s_st = float(s.get("start", 0.0))
+            s_et = float(s.get("end", 0.0))
+            inter = max(0.0, min(s_et, clip_end) - max(s_st, clip_start))
+            seg_dur = max(0.1, s_et - s_st)
+            if inter > 0:
+                words_in_seg = len(s.get("text", "").split())
+                expected_words += words_in_seg * (inter / seg_dur)
+
+        if expected_words >= 3.0:
+            coverage = len(words_in_window) / expected_words
+            if coverage < min_coverage:
+                print(f"[whisper_backend] Cached word coverage is {coverage:.1%} (< {min_coverage:.0%}) -> poor coverage.")
+                return None
+
+    clip_dur = clip_end - clip_start
+    if clip_dur >= 5.0 and len(words_in_window) < 3:
+        if cached_segments:
+            seg_text = " ".join(
+                s.get("text", "") for s in cached_segments
+                if float(s.get("end", 0.0)) > clip_start and float(s.get("start", 0.0)) < clip_end
+            ).strip()
+            if len(seg_text.split()) >= 5:
+                return None
+
+    # Map words using formula: final_t = orig_t - clip_start + audio_delay_s
+    mapped_words = [
+        map_word_to_clip(w, clip_start=clip_start, audio_delay_ms=audio_delay_ms)
+        for w in words_in_window
+    ]
+
+    # Ensure start is non-negative and end > start
+    clamped_words = [
+        Word(
+            start=max(0.0, w.start),
+            end=max(max(0.0, w.start) + 0.05, w.end),
+            text=w.text
+        )
+        for w in mapped_words
+    ]
+    return clamped_words
+
