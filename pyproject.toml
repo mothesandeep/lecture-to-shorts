@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pw-reel-maker"
+version = "2.0.0"
+description = "Physics Wallah (PW) AI Viral Reel Automation Pipeline - Converts educational lectures into high-engagement 9:16 vertical short-form reels."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary / Internal PW" }
+authors = [
+    { name = "PW Video Automation Team" }
+]
+dependencies = [
+    "numpy==2.5.4",
+    "opencv-python==5.0.0.93",
+    "pillow==13.0.0",
+    "scipy==1.18.1",
+    "openai-whisper==20250625",
+    "torch==2.15.0",
+    "google-genai==3.0.0",
+    "pydantic==2.14.3",
+    "pydantic_core==2.50.4",
+    "indic_transliteration==2.3.82",
+    "tqdm==4.70.1",
+    "requests==2.34.2",
+    "mlx==0.32.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-whisper==0.4.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "pyobjc-core==13.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Vision==13.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa==13.0; sys_platform == 'darwin'",
+]
+
+[project.scripts]
+pw-reel = "pipeline:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*"]
+

@@ -195,7 +195,7 @@ def deduplicate_candidate_clips(
             min_dur = min(cand.duration, existing.duration)
             start_diff = abs(cand.start_time - existing.start_time)
 
-            if min_dur > 0 and (overlap / min_dur > overlap_ratio_thr or start_diff < start_diff_thr):
+            if min_dur > 0 and (overlap / min_dur > overlap_ratio_thr or (overlap > 0 and start_diff < start_diff_thr)):
                 is_duplicate = True
                 break
 
@@ -444,7 +444,7 @@ class HookFinder:
         )
 
         user_prompt = (
-            f"Analyze the following lecture transcript lines and identify up to {num_clips} of the top most engaging, "
+            f"Analyze the following lecture transcript lines and identify {num_clips} (or as many as possible up to {num_clips}) of the top most engaging, "
             f"viral, or high-value video clips. Each clip must have a duration between {self.min_duration:.0f}s and {self.max_duration:.0f}s. "
             f"Select exact start_segment_id and end_segment_id for each clip, and score the 5 sub-metrics (1-10).\n\n"
             f"LECTURE TRANSCRIPT:\n{formatted_transcript}"

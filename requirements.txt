@@ -1,0 +1,32 @@
+# PW Reel Maker Automation Pipeline - Pinned Requirements
+# Python 3.10 - 3.14 on macOS (Apple Silicon M-Series) / Linux / Windows
+
+# Core Vision & Video Processing
+numpy==2.5.4
+opencv-python==5.0.0.93
+pillow==13.0.0
+scipy==1.18.1
+
+# Speech Transcription & AI Backends
+openai-whisper==20250625
+torch==2.15.0
+mlx==0.32.4; sys_platform == 'darwin' and platform_machine == 'arm64'
+mlx-whisper==0.4.3; sys_platform == 'darwin' and platform_machine == 'arm64'
+
+# Gemini GenAI SDK & Schemas
+google-genai==3.0.0
+pydantic==2.14.3
+pydantic_core==2.50.4
+
+# Transliteration & Text
+indic_transliteration==2.3.82
+
+# Apple Silicon Vision & Platform Frameworks
+pyobjc-core==13.0; sys_platform == 'darwin'
+pyobjc-framework-Vision==13.0; sys_platform == 'darwin'
+pyobjc-framework-Cocoa==13.0; sys_platform == 'darwin'
+
+# Utilities
+tqdm==4.70.1
+requests==2.34.2
+
