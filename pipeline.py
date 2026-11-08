@@ -143,6 +143,7 @@ def prepare_clip(
     refine_boundaries: bool = False,
     whisper_backend: str = "auto",
     legacy_render: bool = False,
+    detect_every: int = 3,
 ) -> PreparedClip:
     """
     Prepare clip N: snippet cut, reframing plan, word timestamps, and romanization.
@@ -259,7 +260,8 @@ def prepare_clip(
                 preset=reframe_preset,
                 layout=layout,
                 audio_delay_ms=0.0,
-                aspect_ratio=target_aspect
+                aspect_ratio=target_aspect,
+                detect_every=detect_every,
             )
             reframer = FaceReframer(reframe_cfg)
             reframer.run()
@@ -302,7 +304,8 @@ def prepare_clip(
                 preset=reframe_preset,
                 layout=layout,
                 audio_delay_ms=0.0,
-                aspect_ratio=target_aspect
+                aspect_ratio=target_aspect,
+                detect_every=detect_every,
             )
             reframer = FaceReframer(reframe_cfg)
             plan = reframer.plan()
@@ -496,6 +499,7 @@ def process_single_clip(
     whisper_backend: str = "auto",
     legacy_render: bool = False,
     fast: bool = False,
+    detect_every: int = 3,
 ) -> Path:
     """Process a single clip through prepare + render."""
     prepared = prepare_clip(
@@ -520,6 +524,7 @@ def process_single_clip(
         refine_boundaries=refine_boundaries,
         whisper_backend=whisper_backend,
         legacy_render=legacy_render,
+        detect_every=detect_every,
     )
     return render_prepared_clip(
         prepared=prepared,
@@ -554,6 +559,7 @@ def process_clips_pipelined(
     whisper_backend: str = "auto",
     legacy_render: bool = False,
     fast: bool = False,
+    detect_every: int = 3,
 ) -> Tuple[List[Path], List[dict]]:
     """
     Process multiple clips with pipelined preparation:
@@ -589,6 +595,7 @@ def process_clips_pipelined(
             refine_boundaries=refine_boundaries,
             whisper_backend=whisper_backend,
             legacy_render=legacy_render,
+            detect_every=detect_every,
         )
 
     # Use ThreadPoolExecutor(max_workers=1) to pipeline preparation of clip N+1 while clip N renders
@@ -696,6 +703,7 @@ def handle_run(args: argparse.Namespace) -> None:
         whisper_backend=getattr(args, "whisper_backend", "auto"),
         legacy_render=getattr(args, "legacy_render", False),
         fast=getattr(args, "fast", False),
+        detect_every=getattr(args, "detect_every", 3),
     )
 
     # 3. Export Social Media Metadata JSON
@@ -870,6 +878,7 @@ def handle_interactive(args: argparse.Namespace, existing_clips: Optional[List[V
         whisper_backend=getattr(args, "whisper_backend", "auto"),
         legacy_render=getattr(args, "legacy_render", False),
         fast=getattr(args, "fast", False),
+        detect_every=getattr(args, "detect_every", 3),
     )
 
     print("\n" + "=" * 70)
@@ -940,6 +949,7 @@ def handle_clip(args: argparse.Namespace) -> None:
         whisper_backend=getattr(args, "whisper_backend", "auto"),
         legacy_render=getattr(args, "legacy_render", False),
         fast=getattr(args, "fast", False),
+        detect_every=getattr(args, "detect_every", 3),
     )
 
 
@@ -971,6 +981,8 @@ def handle_reframe(args: argparse.Namespace) -> None:
         headroom=args.headroom,
         layout=args.layout,
         audio_delay_ms=args.audio_delay,
+        detect_every=getattr(args, "detect_every", 3),
+        detect_width=getattr(args, "detect_width", 320),
     )
     reframer = FaceReframer(reframe_cfg)
     reframer.run()
@@ -1079,6 +1091,7 @@ Examples:
     p_run.add_argument("--whisper-backend", default="auto", choices=["auto", "openai", "mlx"], help="Whisper backend engine (default: auto, mlx if installed on Apple Silicon, else openai)")
     p_run.add_argument("--legacy-render", action="store_true", help="Use legacy multi-step encoding (reframe encode -> caption encode) instead of single-pass render_reel")
     p_run.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
+    p_run.add_argument("--detect-every", type=int, default=3, help="Run face detection every Nth frame with template tracking in between (default: 3)")
 
     # Command: 'interactive'
     p_inter = subparsers.add_parser("interactive", help="Interactive clip and aspect ratio selection with boundary re-verification")
@@ -1104,6 +1117,7 @@ Examples:
     p_inter.add_argument("--whisper-backend", default="auto", choices=["auto", "openai", "mlx"], help="Whisper backend engine (default: auto, mlx if installed on Apple Silicon, else openai)")
     p_inter.add_argument("--legacy-render", action="store_true", help="Use legacy multi-step encoding (reframe encode -> caption encode) instead of single-pass render_reel")
     p_inter.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
+    p_inter.add_argument("--detect-every", type=int, default=3, help="Run face detection every Nth frame with template tracking in between (default: 3)")
 
     # Command: 'detect'
     p_detect = subparsers.add_parser("detect", help="Detect viral moments & hooks without rendering video")
@@ -1157,6 +1171,7 @@ Examples:
     p_clip.add_argument("--whisper-backend", default="auto", choices=["auto", "openai", "mlx"], help="Whisper backend engine (default: auto, mlx if installed on Apple Silicon, else openai)")
     p_clip.add_argument("--legacy-render", action="store_true", help="Use legacy multi-step encoding (reframe encode -> caption encode) instead of single-pass render_reel")
     p_clip.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
+    p_clip.add_argument("--detect-every", type=int, default=3, help="Run face detection every Nth frame with template tracking in between (default: 3)")
 
     # Command: 'reframe'
     p_reframe = subparsers.add_parser("reframe", help="Standalone face-tracking 9:16 vertical crop")
@@ -1176,6 +1191,8 @@ Examples:
     p_reframe.add_argument("--roi-xmax", type=float, default=1.0, help="Ignore detections to the right (default: 1.0)")
     p_reframe.add_argument("--debug", action="store_true", help="Generate debug video overlay")
     p_reframe.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
+    p_reframe.add_argument("--detect-every", type=int, default=3, help="Run face detection every Nth frame with template tracking in between (default: 3)")
+    p_reframe.add_argument("--detect-width", type=int, default=320, help="Downscale width for face detection (default: 320)")
 
     # Command: 'caption'
     p_caption = subparsers.add_parser("caption", help="Standalone word-by-word captions on vertical video")

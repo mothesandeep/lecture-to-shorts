@@ -114,6 +114,9 @@ class ReframePlan:
     audio_bitrate: str
     detections: Optional[List[List[Tuple[float, float, int, int, float]]]] = None
     static_centers: Optional[List[np.ndarray]] = None
+    lock_pct: float = 0.0
+    num_valid_faces: int = 0
+    detect_every: int = 3
 
 
 @dataclass
@@ -140,6 +143,8 @@ class ReframeConfig:
     layout: str = "direct-crop"
     audio_delay_ms: float = 0.0
     aspect_ratio: str = "9:16"
+    detect_every: int = 3
+    detect_width: int = 320
 
 
 def find_cascade(custom_path: Optional[Path | str] = None) -> Path:
@@ -378,6 +383,8 @@ class FaceReframer:
         else:
             self.layout = "direct-crop"
         self.aspect_ratio = getattr(config, "aspect_ratio", "9:16")
+        self.detect_every = max(1, getattr(config, "detect_every", 3))
+        self.detect_width = max(160, getattr(config, "detect_width", 320))
         self.time_pass1: float = 0.0
         self.time_render: float = 0.0
         self.stage_timings: Dict[str, float] = {
@@ -464,6 +471,23 @@ class FaceReframer:
         last_cut_idx = 0
         frame_idx = 0
 
+        # Setup downscaled Haar detection geometry (~320 px wide, default N=3, no full-res equalizeHist)
+        det_target_w = self.detect_width
+        if width > det_target_w:
+            det_scale = det_target_w / width
+            det_w = det_target_w
+            det_h = max(1, int(round(height * det_scale)))
+            inv_scale_x = width / det_w
+            inv_scale_y = height / det_h
+            min_size_scaled = max(24, int(round(32 * det_scale)))
+        else:
+            det_scale = 1.0
+            det_w, det_h = width, height
+            inv_scale_x, inv_scale_y = 1.0, 1.0
+            min_size_scaled = 32
+
+        detect_every = self.detect_every
+
         # Template tracking assist state for high-recall continuity
         prev_template: Optional[np.ndarray] = None
         prev_box: Optional[Tuple[int, int, int, int]] = None
@@ -495,23 +519,30 @@ class FaceReframer:
             ref_frame = frame_buffer[max(0, len(frame_buffer) - 1 - lag)]
             motion_mask = (cv2.absdiff(blur, ref_frame) > pixel_threshold).astype(np.float32)
 
-            faces = self.face_cascade.detectMultiScale(
-                cv2.equalizeHist(gray),
-                scaleFactor=1.08,
-                minNeighbors=4,
-                minSize=(32, 32)
-            )
-
-            current_frame_dets: List[Tuple[float, float, int, int, float]] = []
             valid_face_boxes: List[Tuple[int, int, int, int, float, float]] = []
-            for (x, y, w, h) in (faces if len(faces) else []):
-                cx = x + w / 2.0
-                cy = y + h / 2.0
-                if cx > width * self.config.roi_xmax:
-                    continue
-                valid_face_boxes.append((x, y, w, h, cx, cy))
 
-            # Fast template tracking assist when Haar temporarily misses during head turns/gestures
+            # 1. Run Haar detection on downscaled gray frame every Nth frame (or if face tracking lost)
+            run_haar = (detect_every <= 1) or ((frame_idx - 1) % detect_every == 0) or (prev_template is None)
+            if run_haar:
+                det_gray = cv2.resize(gray, (det_w, det_h), interpolation=cv2.INTER_LINEAR) if det_scale < 1.0 else gray
+                faces = self.face_cascade.detectMultiScale(
+                    det_gray,
+                    scaleFactor=1.08,
+                    minNeighbors=4,
+                    minSize=(min_size_scaled, min_size_scaled)
+                )
+                for (sx, sy, sw, sh) in (faces if len(faces) else []):
+                    x = int(round(sx * inv_scale_x))
+                    y = int(round(sy * inv_scale_y))
+                    w = int(round(sw * inv_scale_x))
+                    h = int(round(sh * inv_scale_y))
+                    cx = x + w / 2.0
+                    cy = y + h / 2.0
+                    if cx > width * self.config.roi_xmax:
+                        continue
+                    valid_face_boxes.append((x, y, w, h, cx, cy))
+
+            # 2. Fast template tracking assist when Haar wasn't run or temporarily misses
             if not valid_face_boxes and prev_template is not None and prev_box is not None:
                 bx, by, bw, bh = prev_box
                 sx0 = max(0, bx - 60)
@@ -527,6 +558,7 @@ class FaceReframer:
                         ty = sy0 + max_loc[1]
                         valid_face_boxes.append((tx, ty, bw, bh, tx + bw / 2.0, ty + bh / 2.0))
 
+            current_frame_dets: List[Tuple[float, float, int, int, float]] = []
             for (x, y, w, h, cx, cy) in valid_face_boxes:
                 motion = compute_motion_ratio(motion_mask, x, y, w, h, width, height)
                 current_frame_dets.append((cx, cy, w, h, motion))
@@ -628,6 +660,7 @@ class FaceReframer:
 
         valid_mask = ~np.isnan(raw_x)
         num_valid = int(valid_mask.sum())
+        lock_pct = 100.0 * num_valid / num_frames if num_frames > 0 else 0.0
         all_indices = np.arange(num_frames)
 
         if num_valid == 0:
@@ -635,7 +668,7 @@ class FaceReframer:
             interpolated_cx = np.full(num_frames, width / 2.0)
             interpolated_cy = np.full(num_frames, height / 3.0)
         else:
-            print(f"[reframe] Pass 2: Face locked in {num_valid}/{num_frames} frames ({100.0 * num_valid / num_frames:.1f}%)")
+            print(f"[reframe] Pass 2: Face locked in {num_valid}/{num_frames} frames ({lock_pct:.1f}%)")
             interpolated_cx = np.interp(all_indices, all_indices[valid_mask], raw_x[valid_mask])
             interpolated_cy = np.interp(all_indices, all_indices[valid_mask], raw_y[valid_mask])
 
@@ -730,6 +763,9 @@ class FaceReframer:
             audio_bitrate=self.config.audio_bitrate,
             detections=detections,
             static_centers=static_centers,
+            lock_pct=lock_pct,
+            num_valid_faces=num_valid,
+            detect_every=detect_every,
         )
 
     def render(self, plan: Optional[ReframePlan] = None, fast: bool = False) -> Path:
@@ -867,6 +903,31 @@ class FaceReframer:
         return self.render(plan, fast=fast)
 
 
+def compute_corner_drift(
+    plan_a: ReframePlan,
+    plan_b: ReframePlan
+) -> dict[str, float]:
+    """
+    Compute corner drift metrics between two reframing trajectories:
+    - max_drift_px: Maximum Euclidean distance of crop top-left corner
+    - mean_drift_px: Mean Euclidean distance across all frames
+    - max_drift_x: Maximum horizontal corner drift
+    - max_drift_y: Maximum vertical corner drift
+    """
+    n = min(len(plan_a.crop_x0), len(plan_b.crop_x0))
+    if n == 0:
+        return {"max_drift_px": 0.0, "mean_drift_px": 0.0, "max_drift_x": 0.0, "max_drift_y": 0.0}
+    dx = np.abs(plan_a.crop_x0[:n] - plan_b.crop_x0[:n])
+    dy = np.abs(plan_a.crop_y0[:n] - plan_b.crop_y0[:n])
+    euclid = np.sqrt(dx**2 + dy**2)
+    return {
+        "max_drift_px": float(np.max(euclid)),
+        "mean_drift_px": float(np.mean(euclid)),
+        "max_drift_x": float(np.max(dx)),
+        "max_drift_y": float(np.max(dy)),
+    }
+
+
 def reframe_video(
     src: Path | str,
     out: Path | str,
@@ -886,6 +947,8 @@ def reframe_video(
     layout: str = "direct-crop",
     audio_delay_ms: float = 0.0,
     fast: bool = False,
+    detect_every: int = 3,
+    detect_width: int = 320,
 ) -> Path:
     """Convenience functional interface for video reframing."""
     config = ReframeConfig(
@@ -905,7 +968,9 @@ def reframe_video(
         headroom=headroom,
         scene_cut_threshold=scene_cut_threshold,
         layout=layout,
-        audio_delay_ms=audio_delay_ms
+        audio_delay_ms=audio_delay_ms,
+        detect_every=detect_every,
+        detect_width=detect_width,
     )
     reframer = FaceReframer(config)
     return reframer.run(fast=fast)
@@ -928,7 +993,10 @@ if __name__ == "__main__":
     parser.add_argument("--motion-thr", type=float, default=0.03, help="Motion threshold for static slide rejection")
     parser.add_argument("--static-std", type=float, default=8.0, help="Max position std for static slide rejection")
     parser.add_argument("--roi-xmax", type=float, default=1.0, help="Ignore face detections to the right of this fraction")
+    parser.add_argument("--detect-every", type=int, default=3, help="Run face detection every Nth frame with template tracking in between (default: 3)")
+    parser.add_argument("--detect-width", type=int, default=320, help="Downscale width for face detection (default: 320)")
     parser.add_argument("--debug", action="store_true", help="Generate debug video with bounding box overlays")
+    parser.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M)")
     args = parser.parse_args()
 
     src_p = Path(args.src)
