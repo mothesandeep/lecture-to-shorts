@@ -1,0 +1,809 @@
+#!/usr/bin/env python3
+"""
+pipeline.py - Unified High-Performance CLI Pipeline for Long Lectures to 9:16 Viral Reels.
+
+Hardware Target: Apple Silicon (MacBook Air M4, 16GB RAM, macOS, Python 3.14).
+
+Subcommands:
+  python3 pipeline.py run --input lecture.mp4 --clips 3      # End-to-end: AI Hook Detection + 9:16 Reframe + Hinglish Captions
+  python3 pipeline.py detect --input lecture.mp4 --clips 5   # Only detect top viral hooks & print summary
+  python3 pipeline.py clip --input lecture.mp4 --start 15.0 --end 48.0  # Process a specific timestamp slice
+  python3 pipeline.py reframe --input video.mp4 -o out.mp4   # Standalone face-tracking 9:16 crop
+  python3 pipeline.py caption --input vertical.mp4 -o out.mp4 # Standalone Hinglish word-by-word caption burning
+  python3 pipeline.py test                                   # System diagnostics and health check
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import List, Optional
+
+from core.boundary_refiner import refine_clip_boundaries
+from core.captioner import CaptionRenderer, list_styles
+from core.health_check import run_diagnostics
+from core.hook_finder import (
+    HookFinder,
+    ViralClipMetadata,
+    cut_snippet_without_reencode,
+    format_seconds_to_timestamp,
+)
+from core.reframer import FaceReframer, ReframeConfig, reframe_video
+from core.transcriber import HinglishTranscriber
+
+
+def process_single_clip(
+    src_video: Path,
+    clip_info: ViralClipMetadata,
+    output_dir: Path,
+    output_path: Optional[Path] = None,
+    whisper_clip_model: str = "large-v3",
+    llm_model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    smooth_alpha: float = 0.06,
+    chunk_size: int = 4,
+    bottom_offset: int = 380,
+    save_intermediate: bool = False,
+    no_llm: bool = False,
+    style: str = "classic-yellow",
+    reframe_preset: str = "talking_head",
+    layout: str = "direct-crop",
+    audio_delay_ms: float = 500.0,
+    aspect: str = "auto",
+    no_caption: bool = False,
+    refine_boundaries: bool = False,
+) -> Path:
+    """
+    Process one viral clip end-to-end:
+    - High-Precision Boundary Re-verification (+/- 60s window) when enabled.
+    - If 9:16 / 4:5 / 1:1: Reframe -> Word Whisper -> Hinglish Romanize -> Burn Captions.
+    - If 16:9: Preserve 16:9 Widescreen -> Subtitles / Clean export.
+    """
+    # 0. High-Precision Boundary Re-verification if requested
+    if refine_boundaries:
+        refined_start, refined_end = refine_clip_boundaries(
+            video_path=src_video,
+            start_t=clip_info.start_time,
+            end_t=clip_info.end_time,
+            margin_s=60.0
+        )
+        clip_info.start_time = refined_start
+        clip_info.end_time = refined_end
+        clip_info.duration = round(refined_end - refined_start, 2)
+
+    # 1. Resolve target aspect ratio branching
+    target_aspect = aspect.lower().replace("x", ":")
+    if target_aspect == "auto":
+        target_aspect = getattr(clip_info, "aspect_ratio", None) or ("16:9" if clip_info.duration >= 180.0 else "9:16")
+    if target_aspect not in ("9:16", "16:9", "4:5"):
+        target_aspect = "9:16" if clip_info.duration < 180.0 else "16:9"
+
+    is_widescreen = (target_aspect == "16:9")
+    is_4_5 = (target_aspect == "4:5")
+
+    # Output filename naming convention
+    if output_path:
+        out_reel_path = output_path
+    else:
+        if is_widescreen:
+            prefix = f"clip_16x9_{clip_info.clip_id:02d}_{clip_info.slug}.mp4"
+        elif is_4_5:
+            prefix = f"feed_4x5_{clip_info.clip_id:02d}_{clip_info.slug}.mp4"
+        elif layout == "blur-bw":
+            prefix = f"reel_blur_bw_{clip_info.clip_id:02d}_{clip_info.slug}.mp4"
+        else:
+            prefix = f"reel_{clip_info.clip_id:02d}_{clip_info.slug}.mp4"
+        out_reel_path = output_dir / prefix
+
+    if is_widescreen:
+        label = "16:9 WIDESCREEN CLIP"
+    elif is_4_5:
+        label = "4:5 INSTAGRAM FEED CLIP"
+    elif layout == "blur-bw":
+        label = "1:1 BLUR-BW AESTHETIC REEL"
+    else:
+        label = "9:16 VIRAL REEL"
+
+    print("\n" + "-" * 65)
+    print(f"PROCESSING {label} #{clip_info.clip_id}: \"{clip_info.title}\"")
+    print(f"Duration: {clip_info.duration:.1f}s ({format_seconds_to_timestamp(clip_info.start_time)} -> {format_seconds_to_timestamp(clip_info.end_time)})")
+    print(f"Aspect Ratio: {target_aspect} | Canvas Layout: {layout} | Captions: {'Disabled (--no-caption)' if no_caption else f'Enabled ({style})'}")
+    print(f"Hook: \"{clip_info.hook}\"")
+    print("-" * 65)
+
+    if save_intermediate:
+        inter_dir = output_dir / "intermediates"
+        inter_dir.mkdir(parents=True, exist_ok=True)
+        tag = f"{target_aspect.replace(':', 'x')}_{clip_info.clip_id:02d}_{clip_info.slug}"
+        snippet_path = inter_dir / f"snippet_{tag}.mp4"
+        reframed_path = inter_dir / f"reframed_{tag}.mp4"
+        temp_dir = None
+    else:
+        temp_dir = tempfile.TemporaryDirectory(prefix=f"clip_{clip_info.clip_id}_")
+        snippet_path = Path(temp_dir.name) / "snippet.mp4"
+        reframed_path = Path(temp_dir.name) / "reframed.mp4"
+
+    try:
+        # Step A: Cut snippet with accurate timestamp zeroing & audio delay lip-sync
+        print(f"\n[Clip {clip_info.clip_id}] [1/4] Cutting snippet from {clip_info.start_time:.1f}s to {clip_info.end_time:.1f}s (audio_delay={audio_delay_ms:.0f}ms)...")
+        t0 = time.time()
+        cut_snippet_without_reencode(
+            src_video,
+            snippet_path,
+            clip_info.start_time,
+            clip_info.end_time,
+            audio_delay_ms=audio_delay_ms
+        )
+        print(f"[Clip {clip_info.clip_id}] Snippet cut in {time.time() - t0:.2f}s")
+
+        # Step B: Reframe or Preserve 16:9 Widescreen
+        if is_widescreen:
+            print(f"\n[Clip {clip_info.clip_id}] [2/4] Preserving native 16:9 widescreen format (bypassing FaceReframer)...")
+            active_video_path = snippet_path
+        else:
+            reframe_label = "4:5 portrait" if is_4_5 else ("1:1 blur-bw" if layout == "blur-bw" else "9:16 vertical")
+            print(f"\n[Clip {clip_info.clip_id}] [2/4] Face-tracking {reframe_label} reframing (layout={layout}, aspect={target_aspect})...")
+            reframe_cfg = ReframeConfig(
+                src=snippet_path,
+                out=reframed_path,
+                smooth_alpha=smooth_alpha,
+                preset=reframe_preset,
+                layout=layout,
+                audio_delay_ms=0.0,
+                aspect_ratio=target_aspect
+            )
+            reframer = FaceReframer(reframe_cfg)
+            reframer.run()
+            active_video_path = reframed_path
+
+        # Step C & D: Handle optional captioning
+        if no_caption:
+            print(f"\n[Clip {clip_info.clip_id}] [3/4 & 4/4] Captions disabled (--no-caption). Saving clean video...")
+            shutil.copy2(active_video_path, out_reel_path)
+            print(f"\n>>> {'CLIP' if is_widescreen else 'REEL'} #{clip_info.clip_id} READY: {out_reel_path.name}")
+            return out_reel_path
+
+        # Word-level Whisper transcription & Gemini Hinglish romanization
+        print(f"\n[Clip {clip_info.clip_id}] [3/4] Word-level Whisper STT & Hinglish transliteration...")
+        transcriber = HinglishTranscriber(
+            whisper_model=whisper_clip_model,
+            llm_model=llm_model,
+            api_key=api_key,
+            no_llm=no_llm,
+            uppercase=True
+        )
+        words = transcriber.transcribe_and_romanize(
+            video_path=active_video_path
+        )
+
+        # Burn animated word captions via Pillow & FFmpeg
+        print(f"\n[Clip {clip_info.clip_id}] [4/4] Burning animated captions to final video...")
+        chosen_style = style
+        effective_chunk_size = chunk_size
+        effective_bottom_offset = bottom_offset
+
+        if is_widescreen:
+            # Optimize defaults for horizontal widescreen presentation
+            if style == "classic-yellow":
+                chosen_style = "subtitle-16x9"
+            if chunk_size == 4:
+                effective_chunk_size = 6  # 5-7 words per line fit comfortably on widescreen
+            if bottom_offset == 380:
+                effective_bottom_offset = 100  # Clean ~10% bottom margin for 16:9
+
+        renderer = CaptionRenderer(
+            chunk_size=effective_chunk_size,
+            bottom_offset=effective_bottom_offset,
+            style=chosen_style
+        )
+        renderer.render_to_video(
+            input_video=active_video_path,
+            output_video=out_reel_path,
+            words=words
+        )
+
+        print(f"\n>>> {'CLIP' if is_widescreen else 'REEL'} #{clip_info.clip_id} READY: {out_reel_path.name}")
+        return out_reel_path
+
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
+
+
+def handle_run(args: argparse.Namespace) -> None:
+    """Execute end-to-end automated pipeline."""
+    input_path = Path(args.input).expanduser().resolve()
+    if not input_path.is_file():
+        sys.exit(f"[ERROR] Input video not found: {input_path}")
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 70)
+    print(" LECTURE-TO-REEL AI AUTOMATED PIPELINE (Apple Silicon M4)")
+    print("=" * 70)
+    print(f"• Input Video     : {input_path.name}")
+    print(f"• Target Clips    : {args.clips} clips")
+    print(f"• Target Aspect   : {args.aspect} (<180s -> 9:16 vertical, >=180s -> 16:9 widescreen)")
+    print(f"• Captions        : {'Disabled (--no-caption)' if args.no_caption else f'Enabled ({args.style})'}")
+    print(f"• Full Scan Model : Whisper '{args.whisper_full_model}' (Cached)")
+    print(f"• Word Sync Model : Whisper '{args.whisper_clip_model}'")
+    print(f"• AI Brain        : {args.llm_model}")
+    print(f"• Reframe Preset  : {args.reframe_preset}")
+    print(f"• Video Layout    : {args.layout}")
+    print(f"• Audio Delay     : {args.audio_delay:.0f}ms (Lip-sync alignment)")
+    print(f"• Caption Style   : {args.style}")
+    print(f"• Output Directory: {output_dir}")
+    print("=" * 70)
+
+    # 1. AI Highlight & Hook Detection
+    t_start = time.time()
+    finder = HookFinder(
+        whisper_model=args.whisper_full_model,
+        llm_model=args.llm_model,
+        api_key=args.api_key,
+        min_duration=args.min_duration,
+        max_duration=args.max_duration
+    )
+    clips = finder.find_viral_clips(input_path, num_clips=args.clips)
+
+    if not clips:
+        sys.exit("[ERROR] No suitable highlight clips found in lecture transcript.")
+
+    print("\n" + "=" * 70)
+    print(" DETECTED VIRAL HIGHLIGHT HOOKS:")
+    print("=" * 70)
+    for c in clips:
+        print(f"[{c.clip_id}/{len(clips)}] \"{c.title}\" | Score: {c.viral_score}/100 | {c.duration:.1f}s")
+        print(f"     Time: {format_seconds_to_timestamp(c.start_time)} -> {format_seconds_to_timestamp(c.end_time)}")
+        print(f"     Hook: \"{c.hook}\"")
+        print(f"     Why : {c.reason}\n")
+
+    # 2. Process each clip through Reframe + Caption Pipeline
+    generated_reels: List[Path] = []
+    metadata_list = []
+
+    for clip in clips:
+        reel_file = process_single_clip(
+            src_video=input_path,
+            clip_info=clip,
+            output_dir=output_dir,
+            whisper_clip_model=args.whisper_clip_model,
+            llm_model=args.llm_model,
+            api_key=args.api_key,
+            smooth_alpha=args.smooth,
+            chunk_size=args.chunk_size,
+            bottom_offset=args.bottom_offset,
+            save_intermediate=args.save_intermediate,
+            no_llm=args.no_llm,
+            style=args.style,
+            reframe_preset=args.reframe_preset,
+            layout=args.layout,
+            audio_delay_ms=args.audio_delay,
+            aspect=args.aspect,
+            no_caption=args.no_caption,
+            refine_boundaries=getattr(args, "refine_boundaries", False)
+        )
+        generated_reels.append(reel_file)
+        meta_dict = clip.model_dump()
+        meta_dict["output_file"] = str(reel_file)
+        meta_dict["filename"] = reel_file.name
+        metadata_list.append(meta_dict)
+
+    # 3. Export Social Media Metadata JSON
+    metadata_path = output_dir / "reels_metadata.json"
+    metadata_path.write_text(json.dumps(metadata_list, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    total_time = time.time() - t_start
+    print("\n" + "=" * 70)
+    print(" PIPELINE EXECUTION COMPLETE!")
+    print("=" * 70)
+    print(f"Total processing time: {total_time:.1f}s")
+    print(f"Generated {len(generated_reels)} ready-to-post Reels in: {output_dir}")
+    for idx, r in enumerate(generated_reels, 1):
+        print(f"  {idx}. {r.name}")
+    print(f"\nMetadata and post captions saved to: {metadata_path.name}")
+    print("=" * 70)
+
+
+def handle_detect(args: argparse.Namespace) -> None:
+    """Only detect and display viral hooks without rendering video."""
+    input_path = Path(args.input).expanduser().resolve()
+    if not input_path.is_file():
+        sys.exit(f"[ERROR] Input video not found: {input_path}")
+
+    finder = HookFinder(
+        whisper_model=args.whisper_full_model,
+        llm_model=args.llm_model,
+        api_key=args.api_key,
+        min_duration=args.min_duration,
+        max_duration=args.max_duration
+    )
+    clips = finder.find_viral_clips(input_path, num_clips=args.clips)
+
+    print("\n" + "=" * 70)
+    print(f" AI DETECTED {len(clips)} VIRAL HOOKS IN: {input_path.name}")
+    print("=" * 70)
+    for c in clips:
+        print(f"• Clip #{c.clip_id}: \"{c.title}\" (Viral Score: {c.viral_score}/100)")
+        print(f"  Timestamp : {format_seconds_to_timestamp(c.start_time)} -> {format_seconds_to_timestamp(c.end_time)} ({c.duration:.1f}s)")
+        print(f"  Hook Line : \"{c.hook}\"")
+        print(f"  Rationale : {c.reason}\n")
+
+    if args.json_out:
+        out_p = Path(args.json_out).expanduser().resolve()
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(json.dumps([c.model_dump() for c in clips], indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"Exported JSON metadata to: {out_p}")
+
+    if getattr(args, "interactive", False):
+        handle_interactive(args, existing_clips=clips)
+
+
+def handle_interactive(args: argparse.Namespace, existing_clips: Optional[List[ViralClipMetadata]] = None) -> None:
+    """Interactive clip and aspect ratio selection with boundary re-verification."""
+    input_path = Path(args.input).expanduser().resolve()
+    if not input_path.is_file():
+        sys.exit(f"[ERROR] Input video not found: {input_path}")
+
+    output_dir = Path(getattr(args, "output_dir", "output")).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if existing_clips:
+        clips = existing_clips
+    else:
+        finder = HookFinder(
+            whisper_model=getattr(args, "whisper_full_model", "base"),
+            llm_model=getattr(args, "llm_model", None),
+            api_key=getattr(args, "api_key", None),
+            min_duration=getattr(args, "min_duration", 28.0),
+            max_duration=getattr(args, "max_duration", 60.0)
+        )
+        clips = finder.find_viral_clips(input_path, num_clips=getattr(args, "clips", 3))
+
+    if not clips:
+        sys.exit("[ERROR] No highlight hooks detected.")
+
+    print("\n" + "=" * 70)
+    print(f" INTERACTIVE CLIP & ASPECT RATIO STUDIO: {input_path.name}")
+    print("=" * 70)
+    for c in clips:
+        print(f"[{c.clip_id}] \"{c.title}\" | Score: {c.viral_score}/100 | {c.duration:.1f}s")
+        print(f"    Time: {format_seconds_to_timestamp(c.start_time)} -> {format_seconds_to_timestamp(c.end_time)}")
+        print(f"    Hook: \"{c.hook}\"")
+        print(f"    Why : {c.reason}\n")
+    print("=" * 70)
+
+    # 1. Select clip to render
+    while True:
+        try:
+            raw_sel = input("Select clip to render (or 'all', 'q' to quit) [default: 1]: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\nAborted.")
+            return
+
+        if raw_sel in ("q", "quit", "exit"):
+            print("Exiting interactive mode.")
+            return
+        if not raw_sel or raw_sel == "1":
+            selected_clips = [clips[0]]
+            break
+        elif raw_sel == "all":
+            selected_clips = clips
+            break
+        else:
+            try:
+                chosen_ids = [int(x.strip()) for x in raw_sel.split(",") if x.strip()]
+                selected_clips = [c for c in clips if c.clip_id in chosen_ids]
+                if selected_clips:
+                    break
+                print(f"Invalid ID(s). Please choose between 1 and {len(clips)}.")
+            except ValueError:
+                print("Please enter a valid clip number (e.g. 1), comma-separated numbers (e.g. 1,2), or 'all'.")
+
+    # 2. Select aspect ratio preset
+    print("\nSelect aspect ratio preset:")
+    print("  1) 9:16 (Full Vertical Reel - Face Centered)")
+    print("  2) 1:1 with Blur B&W Canvas (Aesthetic 9:16 background, square 1:1 video centered)")
+    print("  3) 4:5 (Instagram Portrait Feed)")
+    print("  4) 16:9 (Native Horizontal - No crop)")
+
+    while True:
+        try:
+            raw_ar = input("Enter choice [1-4, default: 1]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nAborted.")
+            return
+
+        if not raw_ar or raw_ar == "1":
+            chosen_aspect = "9:16"
+            chosen_layout = "direct-crop"
+            break
+        elif raw_ar == "2":
+            chosen_aspect = "9:16"
+            chosen_layout = "blur-bw"
+            break
+        elif raw_ar == "3":
+            chosen_aspect = "4:5"
+            chosen_layout = "direct-crop"
+            break
+        elif raw_ar == "4":
+            chosen_aspect = "16:9"
+            chosen_layout = "direct-crop"
+            break
+        else:
+            print("Invalid choice. Please enter 1, 2, 3, or 4.")
+
+    print(f"\nTarget setting: Aspect={chosen_aspect} | Layout={chosen_layout}")
+    print(f"Beginning high-precision boundary re-verification and rendering for {len(selected_clips)} clip(s)...")
+
+    rendered_files: List[Path] = []
+    for clip in selected_clips:
+        out_file = process_single_clip(
+            src_video=input_path,
+            clip_info=clip,
+            output_dir=output_dir,
+            whisper_clip_model=getattr(args, "whisper_clip_model", "large-v3"),
+            llm_model=getattr(args, "llm_model", None),
+            api_key=getattr(args, "api_key", None),
+            smooth_alpha=getattr(args, "smooth", 0.06),
+            chunk_size=getattr(args, "chunk_size", 4),
+            bottom_offset=getattr(args, "bottom_offset", 380),
+            save_intermediate=getattr(args, "save_intermediate", False),
+            no_llm=getattr(args, "no_llm", False),
+            style=getattr(args, "style", "classic-yellow"),
+            reframe_preset=getattr(args, "reframe_preset", "talking_head"),
+            layout=chosen_layout,
+            audio_delay_ms=getattr(args, "audio_delay", 500.0),
+            aspect=chosen_aspect,
+            no_caption=getattr(args, "no_caption", False),
+            refine_boundaries=True
+        )
+        rendered_files.append(out_file)
+
+    print("\n" + "=" * 70)
+    print(" INTERACTIVE RENDERING COMPLETE!")
+    print("=" * 70)
+    for idx, f in enumerate(rendered_files, 1):
+        print(f"  {idx}. {f.name} ({f.stat().st_size / (1024*1024):.1f} MB) -> {f}")
+    print("=" * 70)
+
+
+def handle_clip(args: argparse.Namespace) -> None:
+    """Process a single manual timestamp range."""
+    input_path = Path(args.input).expanduser().resolve()
+    if not input_path.is_file():
+        sys.exit(f"[ERROR] Input video not found: {input_path}")
+
+    start_t = float(args.start)
+    end_t = float(args.end)
+    if end_t <= start_t:
+        sys.exit(f"[ERROR] End time ({end_t}) must be greater than start time ({start_t}).")
+
+    dur = round(end_t - start_t, 2)
+    target_aspect = args.aspect
+    if target_aspect == "auto":
+        target_aspect = "16:9" if dur >= 180.0 else "9:16"
+
+    if args.out:
+        out_file = Path(args.out).expanduser().resolve()
+    else:
+        prefix = "clip_16x9" if target_aspect == "16:9" else "reel"
+        out_file = input_path.with_name(f"{prefix}_{input_path.stem}_custom.mp4")
+    out_dir = out_file.parent
+
+    clip_meta = ViralClipMetadata(
+        clip_id=1,
+        title=args.title or ("Custom 16:9 Highlight" if target_aspect == "16:9" else "Custom Highlight Reel"),
+        hook=args.hook or "Key Insight",
+        start_time=start_t,
+        end_time=end_t,
+        duration=dur,
+        viral_score=90,
+        reason="Manual selection",
+        slug=out_file.stem,
+        aspect_ratio=target_aspect
+    )
+
+    process_single_clip(
+        src_video=input_path,
+        clip_info=clip_meta,
+        output_dir=out_dir,
+        output_path=out_file,
+        whisper_clip_model=args.whisper_clip_model,
+        llm_model=args.llm_model,
+        api_key=args.api_key,
+        smooth_alpha=args.smooth,
+        chunk_size=args.chunk_size,
+        bottom_offset=args.bottom_offset,
+        save_intermediate=args.save_intermediate,
+        no_llm=args.no_llm,
+        style=args.style,
+        reframe_preset=args.reframe_preset,
+        layout=args.layout,
+        audio_delay_ms=args.audio_delay,
+        aspect=args.aspect,
+        no_caption=args.no_caption,
+        refine_boundaries=getattr(args, "refine_boundaries", False)
+    )
+
+
+def handle_reframe(args: argparse.Namespace) -> None:
+    """Execute standalone reframing only."""
+    src_path = Path(args.input).expanduser().resolve()
+    if not src_path.is_file():
+        sys.exit(f"[ERROR] Input video not found: {src_path}")
+
+    out_path = Path(args.out).expanduser().resolve() if args.out else src_path.with_name(f"{src_path.stem}_reframe.mp4")
+
+    print("=" * 65)
+    print(f" EXECUTING REFRAME WORKFLOW: {src_path.name}")
+    print("=" * 65)
+
+    reframe_cfg = ReframeConfig(
+        src=src_path,
+        out=out_path,
+        cascade_path=Path(args.cascade) if args.cascade else None,
+        csv_path=Path(args.csv) if args.csv else None,
+        smooth_alpha=args.smooth,
+        motion_thr=args.motion_thr,
+        static_std=args.static_std,
+        roi_xmax=args.roi_xmax,
+        debug=args.debug,
+        preset=args.preset,
+        deadzone_px=args.deadzone,
+        zoom=args.zoom,
+        headroom=args.headroom,
+        layout=args.layout,
+        audio_delay_ms=args.audio_delay,
+    )
+    reframer = FaceReframer(reframe_cfg)
+    reframer.run()
+
+
+def handle_caption(args: argparse.Namespace) -> None:
+    """Execute standalone word captioning on existing vertical video."""
+    src_path = Path(args.input).expanduser().resolve()
+    if not src_path.is_file():
+        sys.exit(f"[ERROR] Input video not found: {src_path}")
+
+    out_path = Path(args.out).expanduser().resolve() if args.out else src_path.with_name(f"{src_path.stem}_captioned.mp4")
+
+    print("=" * 65)
+    print(f" EXECUTING CAPTION WORKFLOW: {src_path.name}")
+    print("=" * 65)
+
+    script_hint = (
+        Path(args.script).expanduser().read_text(encoding="utf-8").strip()
+        if args.script and Path(args.script).is_file()
+        else ""
+    )
+    transcriber = HinglishTranscriber(
+        whisper_model=args.whisper_model,
+        llm_model=args.llm_model,
+        api_key=args.api_key,
+        rpm=args.rpm,
+        no_llm=args.no_llm,
+        uppercase=not args.no_upper
+    )
+    words = transcriber.transcribe_and_romanize(
+        video_path=src_path,
+        glossary=args.glossary or "",
+        script_hint=script_hint,
+        whisper_prompt=args.whisper_prompt
+    )
+
+    if args.preview:
+        print(f"\n[Preview: Formatted Word Chunks | Style: {args.style}]")
+        renderer = CaptionRenderer(chunk_size=args.chunk_size, style=args.style)
+        chunks = renderer.build_chunks(words)
+        for c in chunks[:25]:
+            chunk_text = " ".join(w.word for w in c.words)
+            print(f"  [{c.start:05.2f}s - {c.end:05.2f}s] {chunk_text}")
+        print("\n--preview specified: skipping video render.")
+        return
+
+    renderer = CaptionRenderer(
+        font_path=args.font,
+        chunk_size=args.chunk_size,
+        bottom_offset=args.bottom_offset,
+        style=args.style
+    )
+    renderer.render_to_video(
+        input_video=src_path,
+        output_video=out_path,
+        words=words
+    )
+
+
+def build_pipeline_parser() -> argparse.ArgumentParser:
+    """Build unified CLI parser for pipeline.py."""
+    parser = argparse.ArgumentParser(
+        prog="pipeline",
+        description="Unified High-Performance Lecture to 9:16 Viral Reels Pipeline for Apple Silicon.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 pipeline.py interactive --input lecture.mp4        # Interactive clip & aspect ratio studio
+  python3 pipeline.py run --input lecture.mp4 --clips 3      # Automated end-to-end pipeline
+  python3 pipeline.py detect --input lecture.mp4 -I          # Detect hooks + interactive render
+  python3 pipeline.py clip --input lecture.mp4 --start 15.0 --end 48.0 --refine-boundaries
+  python3 pipeline.py reframe --input lecture.mp4 -o vertical.mp4
+  python3 pipeline.py caption --input vertical.mp4 -o captioned.mp4
+  python3 pipeline.py test
+        """
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Pipeline action")
+
+    # Command: 'run'
+    p_run = subparsers.add_parser("run", help="Run full automated pipeline (detect + cut + reframe + caption)")
+    p_run.add_argument("--input", "-i", required=True, help="Path to input lecture video")
+    p_run.add_argument("--clips", "-c", type=int, default=3, help="Number of viral clips to generate (default: 3)")
+    p_run.add_argument("--output-dir", "-o", default="output", help="Output directory for generated reels (default: output/)")
+    p_run.add_argument("--whisper-full-model", default="base", help="Whisper model for full lecture scan (default: base)")
+    p_run.add_argument("--whisper-clip-model", default="large-v3", help="Whisper model for word sync on clip (default: large-v3)")
+    p_run.add_argument("--llm-model", default=os.getenv("HINGLISH_MODEL", "gemini-3.5-flash-lite"), help="Gemini model")
+    p_run.add_argument("--api-key", default=None, help="Gemini API key (overrides GEMINI_API_KEY env)")
+    p_run.add_argument("--min-duration", type=float, default=28.0, help="Min clip duration in seconds (default: 28.0)")
+    p_run.add_argument("--max-duration", type=float, default=60.0, help="Max clip duration in seconds (default: 60.0)")
+    p_run.add_argument("--smooth", type=float, default=0.06, help="Face reframing EMA alpha (default: 0.06)")
+    p_run.add_argument("--chunk-size", type=int, default=4, help="Caption words per chunk (default: 4)")
+    p_run.add_argument("--bottom-offset", type=int, default=380, help="Caption bottom offset in pixels (default: 380)")
+    p_run.add_argument("--save-intermediate", action="store_true", help="Keep cut snippets and reframed videos in output/intermediates/")
+    p_run.add_argument("--no-llm", action="store_true", help="Use local rule-based romanization only")
+    p_run.add_argument("--style", default="classic-yellow", help="Caption visual preset style (default: classic-yellow). Options: classic-yellow, ae-glow, box-highlight, bold-stroke, fade-in, kalakar-fire, karaoke-neon, cyber-neon, cinematic, comic-pop, minimal, subtitle-16x9")
+    p_run.add_argument("--reframe-preset", default="talking_head", help="Reframing preset (default: talking_head). Options: talking_head, lecture, smooth, action")
+    p_run.add_argument("--layout", default="direct-crop", choices=["direct-crop", "blur-bw"], help="Output canvas layout (default: direct-crop). Options: direct-crop, blur-bw")
+    p_run.add_argument("--audio-delay", type=float, default=500.0, help="Audio delay offset in milliseconds to fix lip sync (default: 500.0)")
+    p_run.add_argument("--aspect", default="auto", choices=["auto", "9:16", "16:9", "4:5", "9x16", "16x9", "4x5"], help="Target aspect ratio branching: auto (<180s -> 9:16, >=180s -> 16:9), 9:16, 4:5, or 16:9 (default: auto)")
+    p_run.add_argument("--no-caption", action="store_true", help="Bypass caption burning and export clean trimmed/reframed video")
+    p_run.add_argument("--caption", dest="no_caption", action="store_false", help="Force caption burning (default: enabled)")
+    p_run.add_argument("--refine-boundaries", action="store_true", help="Run high-precision sentence boundary re-verification before rendering")
+
+    # Command: 'interactive'
+    p_inter = subparsers.add_parser("interactive", help="Interactive clip and aspect ratio selection with boundary re-verification")
+    p_inter.add_argument("--input", "-i", required=True, help="Path to input lecture video")
+    p_inter.add_argument("--clips", "-c", type=int, default=5, help="Number of viral hooks to detect (default: 5)")
+    p_inter.add_argument("--output-dir", "-o", default="output", help="Output directory for generated clips (default: output/)")
+    p_inter.add_argument("--whisper-full-model", default="base", help="Whisper model for full lecture scan (default: base)")
+    p_inter.add_argument("--whisper-clip-model", default="large-v3", help="Whisper model for word sync on clip (default: large-v3)")
+    p_inter.add_argument("--llm-model", default=os.getenv("HINGLISH_MODEL", "gemini-3.5-flash-lite"), help="Gemini model")
+    p_inter.add_argument("--api-key", default=None, help="Gemini API key")
+    p_inter.add_argument("--min-duration", type=float, default=28.0, help="Min clip duration in seconds (default: 28.0)")
+    p_inter.add_argument("--max-duration", type=float, default=60.0, help="Max clip duration in seconds (default: 60.0)")
+    p_inter.add_argument("--smooth", type=float, default=0.06, help="Face reframing EMA alpha (default: 0.06)")
+    p_inter.add_argument("--chunk-size", type=int, default=4, help="Caption words per chunk (default: 4)")
+    p_inter.add_argument("--bottom-offset", type=int, default=380, help="Caption bottom offset in pixels (default: 380)")
+    p_inter.add_argument("--save-intermediate", action="store_true", help="Keep cut snippets and reframed videos")
+    p_inter.add_argument("--no-llm", action="store_true", help="Use local rule-based romanization only")
+    p_inter.add_argument("--style", default="classic-yellow", help="Caption visual preset style (default: classic-yellow)")
+    p_inter.add_argument("--reframe-preset", default="talking_head", help="Reframing preset (default: talking_head)")
+    p_inter.add_argument("--audio-delay", type=float, default=500.0, help="Audio delay offset in milliseconds to fix lip sync (default: 500.0)")
+    p_inter.add_argument("--no-caption", action="store_true", help="Bypass caption burning and export clean trimmed/reframed video")
+
+    # Command: 'detect'
+    p_detect = subparsers.add_parser("detect", help="Detect viral moments & hooks without rendering video")
+    p_detect.add_argument("--input", "-i", required=True, help="Path to input lecture video")
+    p_detect.add_argument("--clips", "-c", type=int, default=3, help="Number of hooks to detect (default: 3)")
+    p_detect.add_argument("--whisper-full-model", default="base", help="Whisper model for full lecture scan (default: base)")
+    p_detect.add_argument("--llm-model", default=os.getenv("HINGLISH_MODEL", "gemini-3.5-flash-lite"), help="Gemini model")
+    p_detect.add_argument("--api-key", default=None, help="Gemini API key")
+    p_detect.add_argument("--min-duration", type=float, default=28.0, help="Min duration (default: 28.0)")
+    p_detect.add_argument("--max-duration", type=float, default=60.0, help="Max duration (default: 60.0)")
+    p_detect.add_argument("--json-out", default=None, help="Optional path to export detected hooks as JSON")
+    p_detect.add_argument("--interactive", "-I", action="store_true", help="Launch interactive clip & aspect ratio selector after detection")
+    p_detect.add_argument("--output-dir", "-o", default="output", help="Output directory for generated clips (default: output/)")
+    p_detect.add_argument("--whisper-clip-model", default="large-v3", help="Whisper model for word sync (default: large-v3)")
+    p_detect.add_argument("--style", default="classic-yellow", help="Caption visual preset style (default: classic-yellow)")
+    p_detect.add_argument("--reframe-preset", default="talking_head", help="Reframing preset (default: talking_head)")
+    p_detect.add_argument("--smooth", type=float, default=0.06, help="Face reframing EMA alpha (default: 0.06)")
+    p_detect.add_argument("--chunk-size", type=int, default=4, help="Caption words per chunk (default: 4)")
+    p_detect.add_argument("--bottom-offset", type=int, default=380, help="Caption bottom offset in pixels (default: 380)")
+    p_detect.add_argument("--audio-delay", type=float, default=500.0, help="Audio delay offset in milliseconds (default: 500.0)")
+    p_detect.add_argument("--save-intermediate", action="store_true", help="Keep cut snippets and reframed videos")
+    p_detect.add_argument("--no-llm", action="store_true", help="Use local rule-based romanization only")
+    p_detect.add_argument("--no-caption", action="store_true", help="Bypass caption burning")
+
+    # Command: 'clip'
+    p_clip = subparsers.add_parser("clip", help="Render a specific manual time window end-to-end")
+    p_clip.add_argument("--input", "-i", required=True, help="Path to input lecture video")
+    p_clip.add_argument("--start", type=float, required=True, help="Start time in seconds")
+    p_clip.add_argument("--end", type=float, required=True, help="End time in seconds")
+    p_clip.add_argument("-o", "--out", default=None, help="Path to output reel MP4")
+    p_clip.add_argument("--title", default=None, help="Title for the reel")
+    p_clip.add_argument("--hook", default=None, help="Hook description")
+    p_clip.add_argument("--whisper-clip-model", default="large-v3", help="Whisper model for word timestamps (default: large-v3)")
+    p_clip.add_argument("--llm-model", default=os.getenv("HINGLISH_MODEL", "gemini-3.5-flash-lite"), help="Gemini model")
+    p_clip.add_argument("--api-key", default=None, help="Gemini API key")
+    p_clip.add_argument("--smooth", type=float, default=0.06, help="EMA alpha factor (default: 0.06)")
+    p_clip.add_argument("--chunk-size", type=int, default=4, help="Caption chunk size (default: 4)")
+    p_clip.add_argument("--bottom-offset", type=int, default=380, help="Caption bottom offset (default: 380)")
+    p_clip.add_argument("--save-intermediate", action="store_true", help="Save intermediate snippet and reframed video")
+    p_clip.add_argument("--no-llm", action="store_true", help="Use local rule-based romanizer only")
+    p_clip.add_argument("--style", default="classic-yellow", help="Caption visual preset style (default: classic-yellow). Options: classic-yellow, ae-glow, box-highlight, bold-stroke, fade-in, kalakar-fire, karaoke-neon, cyber-neon, cinematic, comic-pop, minimal, subtitle-16x9")
+    p_clip.add_argument("--reframe-preset", default="talking_head", help="Reframing preset (default: talking_head)")
+    p_clip.add_argument("--layout", default="direct-crop", choices=["direct-crop", "blur-bw"], help="Output canvas layout (default: direct-crop). Options: direct-crop, blur-bw")
+    p_clip.add_argument("--audio-delay", type=float, default=500.0, help="Audio delay offset in milliseconds to fix lip sync (default: 500.0)")
+    p_clip.add_argument("--aspect", default="auto", choices=["auto", "9:16", "16:9", "4:5", "9x16", "16x9", "4x5"], help="Target aspect ratio branching: auto (<180s -> 9:16, >=180s -> 16:9), 9:16, 4:5, or 16:9 (default: auto)")
+    p_clip.add_argument("--no-caption", action="store_true", help="Bypass caption burning and export clean trimmed/reframed video")
+    p_clip.add_argument("--caption", dest="no_caption", action="store_false", help="Force caption burning (default: enabled)")
+    p_clip.add_argument("--refine-boundaries", action="store_true", help="Run high-precision sentence boundary re-verification before rendering")
+
+    # Command: 'reframe'
+    p_reframe = subparsers.add_parser("reframe", help="Standalone face-tracking 9:16 vertical crop")
+    p_reframe.add_argument("--input", "-i", required=True, help="Path to input horizontal video")
+    p_reframe.add_argument("-o", "--out", default=None, help="Path to output vertical video")
+    p_reframe.add_argument("--preset", default="talking_head", help="Reframing preset (default: talking_head). Options: talking_head, lecture, smooth, action")
+    p_reframe.add_argument("--layout", default="direct-crop", choices=["direct-crop", "blur-bw"], help="Output canvas layout (default: direct-crop). Options: direct-crop, blur-bw")
+    p_reframe.add_argument("--audio-delay", type=float, default=0.0, help="Audio delay offset in milliseconds (default: 0.0)")
+    p_reframe.add_argument("--cascade", default=None, help="Path to haarcascade_frontalface_default.xml")
+    p_reframe.add_argument("--csv", default=None, help="Path to export crop keyframes CSV")
+    p_reframe.add_argument("--smooth", type=float, default=None, help="EMA alpha factor (default: from preset)")
+    p_reframe.add_argument("--deadzone", type=float, default=None, help="Dead-zone dampening in pixels (default: from preset)")
+    p_reframe.add_argument("--zoom", type=float, default=None, help="Framing zoom factor (e.g. 1.10)")
+    p_reframe.add_argument("--headroom", type=float, default=None, help="Headroom ratio from top (default: 0.18)")
+    p_reframe.add_argument("--motion-thr", type=float, default=0.03, help="Motion threshold (default: 0.03)")
+    p_reframe.add_argument("--static-std", type=float, default=8.0, help="Static std threshold (default: 8.0)")
+    p_reframe.add_argument("--roi-xmax", type=float, default=1.0, help="Ignore detections to the right (default: 1.0)")
+    p_reframe.add_argument("--debug", action="store_true", help="Generate debug video overlay")
+
+    # Command: 'caption'
+    p_caption = subparsers.add_parser("caption", help="Standalone word-by-word captions on vertical video")
+    p_caption.add_argument("--input", "-i", required=True, help="Path to input vertical video")
+    p_caption.add_argument("-o", "--out", default=None, help="Path to output captioned video")
+    p_caption.add_argument("--whisper-model", default="large-v3", help="Whisper model (default: large-v3)")
+    p_caption.add_argument("--llm-model", default=os.getenv("HINGLISH_MODEL", "gemini-3.5-flash-lite"), help="Gemini model")
+    p_caption.add_argument("--api-key", default=None, help="Gemini API key")
+    p_caption.add_argument("--rpm", type=float, default=8.0, help="Max requests per minute (default: 8.0)")
+    p_caption.add_argument("--script", default=None, help="Path to optional reference script text file")
+    p_caption.add_argument("--glossary", default="", help="Optional comma-separated domain terms")
+    p_caption.add_argument("--whisper-prompt", default=None, help="Optional Whisper initial prompt")
+    p_caption.add_argument("--chunk-size", type=int, default=4, help="Words per caption chunk (default: 4)")
+    p_caption.add_argument("--bottom-offset", type=int, default=380, help="Caption bottom offset in px (default: 380)")
+    p_caption.add_argument("--font", default=None, help="Path to custom TrueType font")
+    p_caption.add_argument("--style", default="classic-yellow", help="Caption visual preset style (default: classic-yellow). Options: classic-yellow, ae-glow, box-highlight, bold-stroke, fade-in, kalakar-fire, karaoke-neon, cyber-neon, cinematic, comic-pop, minimal, subtitle-16x9")
+    p_caption.add_argument("--no-llm", action="store_true", help="Use local rule-based romanizer only")
+    p_caption.add_argument("--no-upper", action="store_true", help="Keep text lowercase")
+    p_caption.add_argument("--preview", action="store_true", help="Transcribe & print preview only without rendering")
+
+    # Command: 'test'
+    p_test = subparsers.add_parser("test", help="Run system diagnostics and health check")
+    p_test.add_argument("--llm-model", default=os.getenv("HINGLISH_MODEL", "gemini-3.5-flash-lite"), help="Model to verify")
+
+    return parser
+
+
+def main() -> None:
+    parser = build_pipeline_parser()
+    if len(sys.argv) < 2:
+        parser.print_help()
+        sys.exit(1)
+
+    args = parser.parse_args()
+    if args.command == "interactive":
+        handle_interactive(args)
+    elif args.command == "run":
+        handle_run(args)
+    elif args.command == "detect":
+        handle_detect(args)
+    elif args.command == "clip":
+        handle_clip(args)
+    elif args.command == "reframe":
+        handle_reframe(args)
+    elif args.command == "caption":
+        handle_caption(args)
+    elif args.command == "test":
+        run_diagnostics(model_name=args.llm_model)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

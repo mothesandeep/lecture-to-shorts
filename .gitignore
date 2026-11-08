@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment variables
+.env
+
+# Media output and scratch artifacts
+output/*
+!output/.gitkeep
+*.mp4
+*.mov
+*.avi
+*.mp3
+*.wav
+*.srt
+*.ass
