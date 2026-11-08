@@ -37,9 +37,14 @@ class TestRenderPlanAndComposer(unittest.TestCase):
         invalid_words = [
             WordCaption(word="क्या", start=0.0, end=1.0, raw_token="क्या"),
         ]
-        invalid_composer = renderer.create_composer(invalid_words, width=1080, height=1920)
+        # In sprite pre-rendering mode, assertion is enforced at sprite creation time
         with self.assertRaises(AssertionError):
-            invalid_composer(dummy_frame, 0.5)
+            renderer.create_composer(invalid_words, width=1080, height=1920)
+
+        # In legacy mode, assertion is enforced at frame render time
+        legacy_composer = renderer.create_composer(invalid_words, width=1080, height=1920, legacy=True)
+        with self.assertRaises(AssertionError):
+            legacy_composer(dummy_frame, 0.5)
 
     def test_caption_composer_outside_timestamps(self):
         """Verify compose returns original frame unmodified when outside caption intervals."""

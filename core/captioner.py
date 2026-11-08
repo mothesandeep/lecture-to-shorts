@@ -68,6 +68,19 @@ class CaptionChunk:
 
 
 @dataclass
+class CaptionSprite:
+    """Precomputed RGBA sprite for a single (chunk, active_word_idx) state."""
+    roi_x0: int
+    roi_y0: int
+    roi_x1: int
+    roi_y1: int
+    sprite_pre: Optional[np.ndarray] = None    # Premultiplied float32 BGR: (H, W, 3)
+    inv_alpha: Optional[np.ndarray] = None     # Inverse float32 alpha: (H, W, 1)
+    alpha_f: Optional[np.ndarray] = None       # Alpha [0, 1] float32: (H, W, 1)
+    sprite_bgr_f: Optional[np.ndarray] = None  # Non-premultiplied float32 BGR: (H, W, 3)
+
+
+@dataclass
 class CaptionStyle:
     """
     Visual style configuration for caption rendering.
@@ -546,16 +559,483 @@ class CaptionRenderer:
                     break
             chunk.meta = best_meta
 
+    def _render_sprite(
+        self,
+        chunk: CaptionChunk,
+        active_word_idx: int,
+        width: int,
+        height: int,
+        y_pos: int,
+    ) -> Optional[CaptionSprite]:
+        """
+        Pre-render a single (chunk, active_word_idx) state into a tight RGBA sprite
+        with premultiplied alpha and bounding coordinates on the target canvas.
+        """
+        if not chunk.meta:
+            return None
+
+        meta = chunk.meta
+        base_font = self.font_mgr.get_font(meta.font_size, font_family=self.style.font_family)
+        active_font = (
+            self.font_mgr.get_font(int(meta.font_size * self.style.bounce_scale), font_family=self.style.font_family)
+            if self.style.word_bounce
+            else base_font
+        )
+
+        x_start = (width - meta.total_width) / 2.0
+        pad_x, pad_y = self.style.chunk_bg_padding if self.style.chunk_bg else (0, 0)
+        pad_bx, pad_by = self.style.active_box_padding if self.style.active_box_highlight else (0, 0)
+
+        glow_extra = (self.style.glow_radius * 4 + self.style.glow_stroke + 20) if self.style.glow else 0
+        shadow_extra_x = max(
+            abs(self.style.shadow_offset[0]) if self.style.shadow_offset else 0,
+            self.style.shadow_3d_depth if self.style.shadow_3d else 0
+        )
+        shadow_extra_y = max(
+            abs(self.style.shadow_offset[1]) if self.style.shadow_offset else 0,
+            self.style.shadow_3d_depth if self.style.shadow_3d else 0
+        )
+        stroke_extra = self.style.stroke_width + 4
+        bounce_extra = int(meta.font_size * abs(self.style.bounce_scale - 1.0)) + abs(self.style.bounce_y_offset) if self.style.word_bounce else 0
+
+        margin_x = max(pad_x, pad_bx) + shadow_extra_x + stroke_extra + glow_extra + bounce_extra + 16
+        margin_y = max(pad_y, pad_by) + shadow_extra_y + stroke_extra + glow_extra + bounce_extra + 16
+
+        meas_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        sample_box = meas_draw.textbbox((0, 0), "Ag", font=base_font)
+        line_h = sample_box[3] - sample_box[1]
+
+        roi_x0 = max(0, int(np.floor(x_start - margin_x)))
+        roi_x1 = min(width, int(np.ceil(x_start + meta.total_width + margin_x)))
+        roi_y0 = max(0, int(np.floor(y_pos - margin_y)))
+        roi_y1 = min(height, int(np.ceil(y_pos + line_h + margin_y)))
+        sw = roi_x1 - roi_x0
+        sh = roi_y1 - roi_y0
+        if sw <= 0 or sh <= 0:
+            return None
+
+        overlay = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        glow_overlay = Image.new("RGBA", (sw, sh), (0, 0, 0, 0)) if self.style.glow else None
+        glow_draw = ImageDraw.Draw(glow_overlay) if glow_overlay else None
+
+        x_start_s = x_start - roi_x0
+        y_pos_s = y_pos - roi_y0
+
+        # A. Chunk container pill backdrop
+        if self.style.chunk_bg:
+            c_rect = [
+                x_start_s - pad_x,
+                y_pos_s - pad_y,
+                x_start_s + meta.total_width + pad_x,
+                y_pos_s + line_h + pad_y + 4
+            ]
+            draw.rounded_rectangle(
+                c_rect,
+                radius=self.style.chunk_bg_radius,
+                fill=self.style.chunk_bg_fill,
+                outline=self.style.chunk_bg_border,
+                width=1
+            )
+
+        # B. Render words
+        x_cursor = x_start_s
+        for idx, w in enumerate(chunk.words):
+            txt = w.word.upper() if self.style.uppercase else w.word
+            # Strict invariant asserting Latin characters only
+            assert not DEV.search(txt) and txt.isascii(), f"Non-Latin token in renderer: {txt!r}"
+
+            slot_w = meta.word_widths[idx]
+            x_center = x_cursor + slot_w / 2.0
+            is_active = (idx == active_word_idx)
+            is_past = (active_word_idx != -1 and idx < active_word_idx)
+            is_upcoming = (active_word_idx != -1 and idx > active_word_idx)
+
+            if is_active:
+                font = active_font
+                word_len = draw.textlength(txt, font=font)
+                x_draw = x_center - word_len / 2.0
+                y_draw = y_pos_s + (self.style.bounce_y_offset if self.style.word_bounce else 0)
+
+                if self.style.active_box_highlight:
+                    bbox = draw.textbbox((x_draw, y_draw), txt, font=font)
+                    box_coords = [
+                        bbox[0] - pad_bx,
+                        bbox[1] - pad_by,
+                        bbox[2] + pad_bx,
+                        bbox[3] + pad_by
+                    ]
+                    draw.rounded_rectangle(
+                        box_coords,
+                        radius=self.style.active_box_radius,
+                        fill=self.style.active_box_fill
+                    )
+                    draw.text(
+                        (x_draw, y_draw),
+                        txt,
+                        font=font,
+                        fill=(*self.style.active_box_text_color, 255)
+                    )
+                else:
+                    if glow_draw:
+                        glow_draw.text(
+                            (x_draw, y_draw),
+                            txt,
+                            font=font,
+                            fill=(*self.style.glow_color, 220),
+                            stroke_width=self.style.glow_stroke,
+                            stroke_fill=(*self.style.glow_color, 220)
+                        )
+
+                    if self.style.shadow_3d:
+                        for d in range(1, self.style.shadow_3d_depth + 1):
+                            draw.text(
+                                (x_draw + int(d * 0.75), y_draw + d),
+                                txt,
+                                font=font,
+                                fill=(*self.style.shadow_3d_color, 255),
+                                stroke_width=self.style.stroke_width,
+                                stroke_fill=(*self.style.shadow_3d_color, 255)
+                            )
+                    elif self.style.shadow_offset:
+                        sx = x_draw + self.style.shadow_offset[0]
+                        sy = y_draw + self.style.shadow_offset[1]
+                        draw.text(
+                            (sx, sy),
+                            txt,
+                            font=font,
+                            fill=self.style.shadow_color,
+                            stroke_width=self.style.stroke_width,
+                            stroke_fill=self.style.shadow_color
+                        )
+
+                    draw.text(
+                        (x_draw, y_draw),
+                        txt,
+                        font=font,
+                        fill=(*self.style.active_color, 255),
+                        stroke_width=self.style.stroke_width,
+                        stroke_fill=(*self.style.stroke_color, 255)
+                    )
+            else:
+                font = base_font
+                x_draw = x_cursor
+                y_draw = y_pos_s
+                base_alpha = self.style.future_alpha if is_upcoming else self.style.past_alpha
+
+                if glow_draw:
+                    g_alpha = int(60 * (base_alpha / 255.0))
+                    glow_draw.text(
+                        (x_draw, y_draw),
+                        txt,
+                        font=font,
+                        fill=(255, 255, 255, g_alpha),
+                        stroke_width=3,
+                        stroke_fill=(255, 255, 255, g_alpha)
+                    )
+
+                if self.style.shadow_offset:
+                    sx = x_draw + self.style.shadow_offset[0]
+                    sy = y_draw + self.style.shadow_offset[1]
+                    s_alpha = int(self.style.shadow_color[3] * (base_alpha / 255.0))
+                    draw.text(
+                        (sx, sy),
+                        txt,
+                        font=font,
+                        fill=(*self.style.shadow_color[:3], s_alpha),
+                        stroke_width=self.style.stroke_width,
+                        stroke_fill=(*self.style.shadow_color[:3], s_alpha)
+                    )
+                draw.text(
+                    (x_draw, y_draw),
+                    txt,
+                    font=font,
+                    fill=(*self.style.inactive_color, base_alpha),
+                    stroke_width=self.style.stroke_width,
+                    stroke_fill=(*self.style.stroke_color, base_alpha)
+                )
+
+            x_cursor += slot_w + meta.space_width
+
+        # C. Composite glow inside sprite bounding box
+        if glow_overlay:
+            glow_blurred = glow_overlay.filter(ImageFilter.GaussianBlur(radius=self.style.glow_radius))
+            sprite_pil = Image.alpha_composite(glow_blurred, overlay)
+        else:
+            sprite_pil = overlay
+
+        # D. Tighten bounding box
+        sprite_arr = np.array(sprite_pil)
+        alpha_chan = sprite_arr[:, :, 3]
+        if not np.any(alpha_chan > 0):
+            return None
+
+        rows = np.any(alpha_chan > 0, axis=1)
+        cols = np.any(alpha_chan > 0, axis=0)
+        ymin, ymax = np.where(rows)[0][[0, -1]]
+        xmin, xmax = np.where(cols)[0][[0, -1]]
+
+        tight_x0 = roi_x0 + int(xmin)
+        tight_x1 = roi_x0 + int(xmax) + 1
+        tight_y0 = roi_y0 + int(ymin)
+        tight_y1 = roi_y0 + int(ymax) + 1
+
+        tight_arr = sprite_arr[ymin:ymax + 1, xmin:xmax + 1]
+        sprite_bgr_f = tight_arr[:, :, [2, 1, 0]].astype(np.float32)
+        alpha_f = tight_arr[:, :, 3:4].astype(np.float32) / 255.0
+        sprite_pre = sprite_bgr_f * alpha_f
+        inv_alpha = 1.0 - alpha_f
+
+        return CaptionSprite(
+            roi_x0=tight_x0,
+            roi_y0=tight_y0,
+            roi_x1=tight_x1,
+            roi_y1=tight_y1,
+            sprite_pre=sprite_pre,
+            inv_alpha=inv_alpha,
+            alpha_f=alpha_f,
+            sprite_bgr_f=sprite_bgr_f,
+        )
+
+    def _render_frame_legacy(
+        self,
+        frame: np.ndarray,
+        active_chunk: CaptionChunk,
+        active_word_idx: int,
+        current_time: float,
+        width: int,
+        height: int,
+        y_pos: int,
+        needs_alpha: bool,
+    ) -> np.ndarray:
+        """Reference legacy frame-by-frame PIL drawing implementation (for pixel verification)."""
+        meta = active_chunk.meta
+        if not meta:
+            return frame
+        base_font = self.font_mgr.get_font(meta.font_size, font_family=self.style.font_family)
+
+        if needs_alpha:
+            pil_base = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay)
+
+            glow_overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0)) if self.style.glow else None
+            glow_draw = ImageDraw.Draw(glow_overlay) if glow_overlay else None
+
+            fade_mult = 1.0
+            if self.style.chunk_fade_in:
+                dt = current_time - active_chunk.start
+                if 0.0 <= dt < self.style.chunk_fade_duration:
+                    fade_mult = max(0.1, min(1.0, dt / self.style.chunk_fade_duration))
+
+            x_start = (width - meta.total_width) / 2.0
+
+            if self.style.chunk_bg:
+                sample_box = draw.textbbox((0, 0), "Ag", font=base_font)
+                line_h = sample_box[3] - sample_box[1]
+                pad_x, pad_y = self.style.chunk_bg_padding
+                c_rect = [
+                    x_start - pad_x,
+                    y_pos - pad_y,
+                    x_start + meta.total_width + pad_x,
+                    y_pos + line_h + pad_y + 4
+                ]
+                bg_fill = self.style.chunk_bg_fill
+                if fade_mult < 1.0:
+                    bg_fill = (*bg_fill[:3], int(bg_fill[3] * fade_mult))
+                border = self.style.chunk_bg_border
+                if border and fade_mult < 1.0:
+                    border = (*border[:3], int(border[3] * fade_mult))
+                draw.rounded_rectangle(
+                    c_rect,
+                    radius=self.style.chunk_bg_radius,
+                    fill=bg_fill,
+                    outline=border,
+                    width=1
+                )
+
+            active_font = (
+                self.font_mgr.get_font(int(meta.font_size * self.style.bounce_scale), font_family=self.style.font_family)
+                if self.style.word_bounce
+                else base_font
+            )
+
+            x_cursor = x_start
+            for idx, w in enumerate(active_chunk.words):
+                txt = w.word.upper() if self.style.uppercase else w.word
+                assert not DEV.search(txt) and txt.isascii(), f"Non-Latin token in renderer: {txt!r}"
+
+                slot_w = meta.word_widths[idx]
+                x_center = x_cursor + slot_w / 2.0
+                is_active = (idx == active_word_idx)
+                is_past = (active_word_idx != -1 and idx < active_word_idx)
+                is_upcoming = (active_word_idx != -1 and idx > active_word_idx)
+
+                if is_active:
+                    font = active_font
+                    word_len = draw.textlength(txt, font=font)
+                    x_draw = x_center - word_len / 2.0
+                    y_draw = y_pos + (self.style.bounce_y_offset if self.style.word_bounce else 0)
+
+                    if self.style.active_box_highlight:
+                        pad_bx, pad_by = self.style.active_box_padding
+                        bbox = draw.textbbox((x_draw, y_draw), txt, font=font)
+                        box_coords = [
+                            bbox[0] - pad_bx,
+                            bbox[1] - pad_by,
+                            bbox[2] + pad_bx,
+                            bbox[3] + pad_by
+                        ]
+                        box_fill = self.style.active_box_fill
+                        if fade_mult < 1.0:
+                            box_fill = (*box_fill[:3], int(box_fill[3] * fade_mult))
+                        draw.rounded_rectangle(
+                            box_coords,
+                            radius=self.style.active_box_radius,
+                            fill=box_fill
+                        )
+                        alpha = int(255 * fade_mult)
+                        draw.text(
+                            (x_draw, y_draw),
+                            txt,
+                            font=font,
+                            fill=(*self.style.active_box_text_color, alpha)
+                        )
+                    else:
+                        if glow_draw:
+                            g_alpha = int(220 * fade_mult)
+                            glow_draw.text(
+                                (x_draw, y_draw),
+                                txt,
+                                font=font,
+                                fill=(*self.style.glow_color, g_alpha),
+                                stroke_width=self.style.glow_stroke,
+                                stroke_fill=(*self.style.glow_color, g_alpha)
+                            )
+
+                        if self.style.shadow_3d:
+                            s_alpha = int(255 * fade_mult)
+                            for d in range(1, self.style.shadow_3d_depth + 1):
+                                draw.text(
+                                    (x_draw + int(d * 0.75), y_draw + d),
+                                    txt,
+                                    font=font,
+                                    fill=(*self.style.shadow_3d_color, s_alpha),
+                                    stroke_width=self.style.stroke_width,
+                                    stroke_fill=(*self.style.shadow_3d_color, s_alpha)
+                                )
+                        elif self.style.shadow_offset:
+                            sx = x_draw + self.style.shadow_offset[0]
+                            sy = y_draw + self.style.shadow_offset[1]
+                            s_alpha = int(self.style.shadow_color[3] * fade_mult)
+                            draw.text(
+                                (sx, sy),
+                                txt,
+                                font=font,
+                                fill=(*self.style.shadow_color[:3], s_alpha),
+                                stroke_width=self.style.stroke_width,
+                                stroke_fill=(*self.style.shadow_color[:3], s_alpha)
+                            )
+
+                        alpha = int(255 * fade_mult)
+                        draw.text(
+                            (x_draw, y_draw),
+                            txt,
+                            font=font,
+                            fill=(*self.style.active_color, alpha),
+                            stroke_width=self.style.stroke_width,
+                            stroke_fill=(*self.style.stroke_color, alpha)
+                        )
+                else:
+                    font = base_font
+                    x_draw = x_cursor
+                    y_draw = y_pos
+                    base_alpha = self.style.future_alpha if is_upcoming else self.style.past_alpha
+                    alpha = int(base_alpha * fade_mult)
+
+                    if glow_draw:
+                        g_alpha = int(60 * (alpha / 255.0))
+                        glow_draw.text(
+                            (x_draw, y_draw),
+                            txt,
+                            font=font,
+                            fill=(255, 255, 255, g_alpha),
+                            stroke_width=3,
+                            stroke_fill=(255, 255, 255, g_alpha)
+                        )
+
+                    if self.style.shadow_offset:
+                        sx = x_draw + self.style.shadow_offset[0]
+                        sy = y_draw + self.style.shadow_offset[1]
+                        s_alpha = int(self.style.shadow_color[3] * (alpha / 255.0))
+                        draw.text(
+                            (sx, sy),
+                            txt,
+                            font=font,
+                            fill=(*self.style.shadow_color[:3], s_alpha),
+                            stroke_width=self.style.stroke_width,
+                            stroke_fill=(*self.style.shadow_color[:3], s_alpha)
+                        )
+                    draw.text(
+                        (x_draw, y_draw),
+                        txt,
+                        font=font,
+                        fill=(*self.style.inactive_color, alpha),
+                        stroke_width=self.style.stroke_width,
+                        stroke_fill=(*self.style.stroke_color, alpha)
+                    )
+
+                x_cursor += slot_w + meta.space_width
+
+            pil_rgba = pil_base.convert("RGBA")
+            if glow_overlay:
+                glow_blurred = glow_overlay.filter(ImageFilter.GaussianBlur(radius=self.style.glow_radius))
+                pil_rgba = Image.alpha_composite(pil_rgba, glow_blurred)
+            pil_rgba = Image.alpha_composite(pil_rgba, overlay)
+            return cv2.cvtColor(np.array(pil_rgba.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+        else:
+            pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(pil_image)
+
+            x_cursor = (width - meta.total_width) / 2.0
+            for idx, w in enumerate(active_chunk.words):
+                txt = w.word.upper() if self.style.uppercase else w.word
+                assert not DEV.search(txt) and txt.isascii(), f"Non-Latin token in renderer: {txt!r}"
+
+                fill_color = self.active_color if idx == active_word_idx else self.inactive_color
+                draw.text(
+                    (x_cursor, y_pos),
+                    txt,
+                    font=base_font,
+                    fill=fill_color,
+                    stroke_width=self.stroke_width,
+                    stroke_fill=self.stroke_color
+                )
+                x_cursor += meta.word_widths[idx] + meta.space_width
+
+            return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+
     def create_composer(
         self,
         words: List[WordCaption],
         width: int,
         height: int,
+        legacy: bool = False,
     ) -> Callable[[np.ndarray, float], np.ndarray]:
         """
         Create a per-frame caption compositor callable.
         Takes (frame: np.ndarray [BGR], current_time: float) -> np.ndarray [BGR].
-        Precomputes chunks and layouts so per-frame drawing is fast.
+
+        When legacy=False (default):
+        - Pre-renders each (chunk, active_word_idx) state ONCE as an RGBA sprite covering
+          only the text bounding box plus padding.
+        - Per frame, blends only the sprite ROI into the frame with premultiplied alpha
+          in NumPy (no full-frame PIL conversions, no full-frame alpha composite).
+        - Frames with no active caption pass through untouched (0 color conversions).
+
+        When legacy=True:
+        - Uses the original frame-by-frame PIL drawing logic (for pixel verification).
         """
         chunks = self.build_chunks(words)
         self.calculate_layouts(chunks, width, height)
@@ -576,27 +1056,79 @@ class CaptionRenderer:
 
         y_pos = max(30, height - effective_bottom_offset + self.style.bottom_offset_adjust)
 
-        needs_alpha = (
-            self.style.chunk_bg
-            or self.style.active_box_highlight
-            or self.style.shadow_offset is not None
-            or self.style.future_alpha < 255
-            or self.style.chunk_fade_in
-            or self.style.glow
-            or self.style.shadow_3d
-        )
+        if legacy:
+            needs_alpha = (
+                self.style.chunk_bg
+                or self.style.active_box_highlight
+                or self.style.shadow_offset is not None
+                or self.style.future_alpha < 255
+                or self.style.chunk_fade_in
+                or self.style.glow
+                or self.style.shadow_3d
+            )
+
+            def legacy_compose(frame: np.ndarray, current_time: float) -> np.ndarray:
+                if not chunks:
+                    return frame
+
+                active_chunk: Optional[CaptionChunk] = None
+                active_word_idx = -1
+
+                for chunk in chunks:
+                    if chunk.start <= current_time <= chunk.end + 0.20:
+                        active_chunk = chunk
+                        for idx, w in enumerate(chunk.words):
+                            if w.start <= current_time <= w.end:
+                                active_word_idx = idx
+                                break
+                        if active_word_idx == -1 and chunk.words:
+                            for idx, w in enumerate(chunk.words):
+                                if current_time >= w.start:
+                                    active_word_idx = idx
+                        break
+
+                if not active_chunk or not active_chunk.meta:
+                    return frame
+
+                return self._render_frame_legacy(
+                    frame=frame,
+                    active_chunk=active_chunk,
+                    active_word_idx=active_word_idx,
+                    current_time=current_time,
+                    width=width,
+                    height=height,
+                    y_pos=y_pos,
+                    needs_alpha=needs_alpha,
+                )
+
+            return legacy_compose
+
+        # ── Pre-Render Sprites Path (Ultra-Fast NumPy Premultiplied Alpha Blend) ──
+        sprites: Dict[Tuple[int, int], CaptionSprite] = {}
+        for c_idx, chunk in enumerate(chunks):
+            if not chunk.meta:
+                continue
+            for a_idx in range(-1, len(chunk.words)):
+                sp = self._render_sprite(chunk, a_idx, width, height, y_pos)
+                if sp is not None:
+                    sprites[(c_idx, a_idx)] = sp
+
+        chunk_fade_in = self.style.chunk_fade_in
+        chunk_fade_dur = self.style.chunk_fade_duration
 
         def compose(frame: np.ndarray, current_time: float) -> np.ndarray:
             if not chunks:
                 return frame
 
             # Locate active chunk for current timestamp
-            active_chunk: Optional[CaptionChunk] = None
+            active_chunk_idx = -1
             active_word_idx = -1
+            active_chunk_start = 0.0
 
-            for chunk in chunks:
+            for c_idx, chunk in enumerate(chunks):
                 if chunk.start <= current_time <= chunk.end + 0.20:
-                    active_chunk = chunk
+                    active_chunk_idx = c_idx
+                    active_chunk_start = chunk.start
                     for idx, w in enumerate(chunk.words):
                         if w.start <= current_time <= w.end:
                             active_word_idx = idx
@@ -607,215 +1139,37 @@ class CaptionRenderer:
                                 active_word_idx = idx
                     break
 
-            if not active_chunk or not active_chunk.meta:
+            if active_chunk_idx == -1:
+                # Untouched pass-through when no caption is active
                 return frame
 
-            meta = active_chunk.meta
-            base_font = self.font_mgr.get_font(meta.font_size, font_family=self.style.font_family)
+            sprite = sprites.get((active_chunk_idx, active_word_idx))
+            if sprite is None or sprite.sprite_pre is None:
+                return frame
 
-            if needs_alpha:
-                # ── Advanced RGBA Overlay Compositing ──────────────────────────────
-                pil_base = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-                draw = ImageDraw.Draw(overlay)
+            y0, y1 = sprite.roi_y0, sprite.roi_y1
+            x0, x1 = sprite.roi_x0, sprite.roi_x1
 
-                glow_overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0)) if self.style.glow else None
-                glow_draw = ImageDraw.Draw(glow_overlay) if glow_overlay else None
+            if chunk_fade_in:
+                dt = current_time - active_chunk_start
+                if 0.0 <= dt < chunk_fade_dur:
+                    fade_mult = max(0.1, min(1.0, dt / chunk_fade_dur))
+                    eff_alpha = sprite.alpha_f * fade_mult
+                    eff_inv_alpha = 1.0 - eff_alpha
+                    eff_sprite_pre = sprite.sprite_bgr_f * eff_alpha
+                    roi = frame[y0:y1, x0:x1]
+                    frame[y0:y1, x0:x1] = np.clip(
+                        np.round(roi.astype(np.float32) * eff_inv_alpha + eff_sprite_pre),
+                        0, 255
+                    ).astype(np.uint8)
+                    return frame
 
-                fade_mult = 1.0
-                if self.style.chunk_fade_in:
-                    dt = current_time - active_chunk.start
-                    if 0.0 <= dt < self.style.chunk_fade_duration:
-                        fade_mult = max(0.1, min(1.0, dt / self.style.chunk_fade_duration))
-
-                x_start = (width - meta.total_width) / 2.0
-
-                if self.style.chunk_bg:
-                    sample_box = draw.textbbox((0, 0), "Ag", font=base_font)
-                    line_h = sample_box[3] - sample_box[1]
-                    pad_x, pad_y = self.style.chunk_bg_padding
-                    c_rect = [
-                        x_start - pad_x,
-                        y_pos - pad_y,
-                        x_start + meta.total_width + pad_x,
-                        y_pos + line_h + pad_y + 4
-                    ]
-                    bg_fill = self.style.chunk_bg_fill
-                    if fade_mult < 1.0:
-                        bg_fill = (*bg_fill[:3], int(bg_fill[3] * fade_mult))
-                    border = self.style.chunk_bg_border
-                    if border and fade_mult < 1.0:
-                        border = (*border[:3], int(border[3] * fade_mult))
-                    draw.rounded_rectangle(
-                        c_rect,
-                        radius=self.style.chunk_bg_radius,
-                        fill=bg_fill,
-                        outline=border,
-                        width=1
-                    )
-
-                active_font = (
-                    self.font_mgr.get_font(int(meta.font_size * self.style.bounce_scale), font_family=self.style.font_family)
-                    if self.style.word_bounce
-                    else base_font
-                )
-
-                x_cursor = x_start
-                for idx, w in enumerate(active_chunk.words):
-                    txt = w.word.upper() if self.style.uppercase else w.word
-                    assert not DEV.search(txt) and txt.isascii(), f"Non-Latin token in renderer: {txt!r}"
-
-                    slot_w = meta.word_widths[idx]
-                    x_center = x_cursor + slot_w / 2.0
-                    is_active = (idx == active_word_idx)
-                    is_past = (active_word_idx != -1 and idx < active_word_idx)
-                    is_upcoming = (active_word_idx != -1 and idx > active_word_idx)
-
-                    if is_active:
-                        font = active_font
-                        word_len = draw.textlength(txt, font=font)
-                        x_draw = x_center - word_len / 2.0
-                        y_draw = y_pos + (self.style.bounce_y_offset if self.style.word_bounce else 0)
-
-                        if self.style.active_box_highlight:
-                            pad_bx, pad_by = self.style.active_box_padding
-                            bbox = draw.textbbox((x_draw, y_draw), txt, font=font)
-                            box_coords = [
-                                bbox[0] - pad_bx,
-                                bbox[1] - pad_by,
-                                bbox[2] + pad_bx,
-                                bbox[3] + pad_by
-                            ]
-                            box_fill = self.style.active_box_fill
-                            if fade_mult < 1.0:
-                                box_fill = (*box_fill[:3], int(box_fill[3] * fade_mult))
-                            draw.rounded_rectangle(
-                                box_coords,
-                                radius=self.style.active_box_radius,
-                                fill=box_fill
-                            )
-                            alpha = int(255 * fade_mult)
-                            draw.text(
-                                (x_draw, y_draw),
-                                txt,
-                                font=font,
-                                fill=(*self.style.active_box_text_color, alpha)
-                            )
-                        else:
-                            if glow_draw:
-                                g_alpha = int(220 * fade_mult)
-                                glow_draw.text(
-                                    (x_draw, y_draw),
-                                    txt,
-                                    font=font,
-                                    fill=(*self.style.glow_color, g_alpha),
-                                    stroke_width=self.style.glow_stroke,
-                                    stroke_fill=(*self.style.glow_color, g_alpha)
-                                )
-
-                            if self.style.shadow_3d:
-                                s_alpha = int(255 * fade_mult)
-                                for d in range(1, self.style.shadow_3d_depth + 1):
-                                    draw.text(
-                                        (x_draw + int(d * 0.75), y_draw + d),
-                                        txt,
-                                        font=font,
-                                        fill=(*self.style.shadow_3d_color, s_alpha),
-                                        stroke_width=self.style.stroke_width,
-                                        stroke_fill=(*self.style.shadow_3d_color, s_alpha)
-                                    )
-                            elif self.style.shadow_offset:
-                                sx = x_draw + self.style.shadow_offset[0]
-                                sy = y_draw + self.style.shadow_offset[1]
-                                s_alpha = int(self.style.shadow_color[3] * fade_mult)
-                                draw.text(
-                                    (sx, sy),
-                                    txt,
-                                    font=font,
-                                    fill=(*self.style.shadow_color[:3], s_alpha),
-                                    stroke_width=self.style.stroke_width,
-                                    stroke_fill=(*self.style.shadow_color[:3], s_alpha)
-                                )
-
-                            alpha = int(255 * fade_mult)
-                            draw.text(
-                                (x_draw, y_draw),
-                                txt,
-                                font=font,
-                                fill=(*self.style.active_color, alpha),
-                                stroke_width=self.style.stroke_width,
-                                stroke_fill=(*self.style.stroke_color, alpha)
-                            )
-                    else:
-                        font = base_font
-                        x_draw = x_cursor
-                        y_draw = y_pos
-                        base_alpha = self.style.future_alpha if is_upcoming else self.style.past_alpha
-                        alpha = int(base_alpha * fade_mult)
-
-                        if glow_draw:
-                            g_alpha = int(60 * (alpha / 255.0))
-                            glow_draw.text(
-                                (x_draw, y_draw),
-                                txt,
-                                font=font,
-                                fill=(255, 255, 255, g_alpha),
-                                stroke_width=3,
-                                stroke_fill=(255, 255, 255, g_alpha)
-                            )
-
-                        if self.style.shadow_offset:
-                            sx = x_draw + self.style.shadow_offset[0]
-                            sy = y_draw + self.style.shadow_offset[1]
-                            s_alpha = int(self.style.shadow_color[3] * (alpha / 255.0))
-                            draw.text(
-                                (sx, sy),
-                                txt,
-                                font=font,
-                                fill=(*self.style.shadow_color[:3], s_alpha),
-                                stroke_width=self.style.stroke_width,
-                                stroke_fill=(*self.style.shadow_color[:3], s_alpha)
-                            )
-                        draw.text(
-                            (x_draw, y_draw),
-                            txt,
-                            font=font,
-                            fill=(*self.style.inactive_color, alpha),
-                            stroke_width=self.style.stroke_width,
-                            stroke_fill=(*self.style.stroke_color, alpha)
-                        )
-
-                    x_cursor += slot_w + meta.space_width
-
-                pil_rgba = pil_base.convert("RGBA")
-                if glow_overlay:
-                    glow_blurred = glow_overlay.filter(ImageFilter.GaussianBlur(radius=self.style.glow_radius))
-                    pil_rgba = Image.alpha_composite(pil_rgba, glow_blurred)
-                pil_rgba = Image.alpha_composite(pil_rgba, overlay)
-                return cv2.cvtColor(np.array(pil_rgba.convert("RGB")), cv2.COLOR_RGB2BGR)
-
-            else:
-                # ── Direct RGB Drawing (Zero-Overhead for Classic-Yellow) ─────────
-                pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                draw = ImageDraw.Draw(pil_image)
-
-                x_cursor = (width - meta.total_width) / 2.0
-                for idx, w in enumerate(active_chunk.words):
-                    txt = w.word.upper() if self.style.uppercase else w.word
-                    assert not DEV.search(txt) and txt.isascii(), f"Non-Latin token in renderer: {txt!r}"
-
-                    fill_color = self.active_color if idx == active_word_idx else self.inactive_color
-                    draw.text(
-                        (x_cursor, y_pos),
-                        txt,
-                        font=base_font,
-                        fill=fill_color,
-                        stroke_width=self.stroke_width,
-                        stroke_fill=self.stroke_color
-                    )
-                    x_cursor += meta.word_widths[idx] + meta.space_width
-
-                return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+            roi = frame[y0:y1, x0:x1]
+            frame[y0:y1, x0:x1] = np.clip(
+                np.round(roi.astype(np.float32) * sprite.inv_alpha + sprite.sprite_pre),
+                0, 255
+            ).astype(np.uint8)
+            return frame
 
         return compose
 
