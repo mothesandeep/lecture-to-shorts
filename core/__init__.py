@@ -12,6 +12,10 @@ from core.captioner import (
     get_style,
     list_styles,
 )
+from core.audio_features import (
+    AudioFeatureExtractor,
+    extract_audio_samples,
+)
 from core.av_sync import (
     cut_snippet_accurate,
     ensure_cfr_video,
@@ -20,11 +24,17 @@ from core.av_sync import (
 )
 from core.health_check import run_diagnostics
 from core.hook_finder import (
+    DEFAULT_VIRAL_SCORE_WEIGHTS,
     HookFinder,
+    ViralClipCandidate,
     ViralClipMetadata,
+    check_face_presence,
+    compute_weighted_viral_score,
     cut_snippet_without_reencode,
+    deduplicate_candidate_clips,
     extract_audio,
     format_seconds_to_timestamp,
+    normalize_segment_id,
 )
 from core.reframer import (
     REFRAME_PRESETS,
@@ -72,6 +82,14 @@ __all__ = [
     "run_diagnostics",
     "HookFinder",
     "ViralClipMetadata",
+    "ViralClipCandidate",
+    "DEFAULT_VIRAL_SCORE_WEIGHTS",
+    "compute_weighted_viral_score",
+    "deduplicate_candidate_clips",
+    "check_face_presence",
+    "normalize_segment_id",
+    "AudioFeatureExtractor",
+    "extract_audio_samples",
     "cut_snippet_without_reencode",
     "cut_snippet_accurate",
     "ensure_cfr_video",

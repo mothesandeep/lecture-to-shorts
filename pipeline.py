@@ -664,6 +664,7 @@ def handle_run(args: argparse.Namespace) -> None:
         min_duration=args.min_duration,
         max_duration=args.max_duration,
         backend=getattr(args, "whisper_backend", "auto"),
+        filter_face_presence=getattr(args, "filter_face_presence", False),
     )
     clips = finder.find_viral_clips(input_path, num_clips=args.clips)
 
@@ -735,6 +736,7 @@ def handle_detect(args: argparse.Namespace) -> None:
         min_duration=args.min_duration,
         max_duration=args.max_duration,
         backend=getattr(args, "whisper_backend", "auto"),
+        filter_face_presence=getattr(args, "filter_face_presence", False),
     )
     clips = finder.find_viral_clips(input_path, num_clips=args.clips)
 
@@ -776,6 +778,7 @@ def handle_interactive(args: argparse.Namespace, existing_clips: Optional[List[V
             min_duration=getattr(args, "min_duration", 28.0),
             max_duration=getattr(args, "max_duration", 60.0),
             backend=getattr(args, "whisper_backend", "auto"),
+            filter_face_presence=getattr(args, "filter_face_presence", False),
         )
         clips = finder.find_viral_clips(input_path, num_clips=getattr(args, "clips", 3))
 
@@ -1092,6 +1095,7 @@ Examples:
     p_run.add_argument("--legacy-render", action="store_true", help="Use legacy multi-step encoding (reframe encode -> caption encode) instead of single-pass render_reel")
     p_run.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
     p_run.add_argument("--detect-every", type=int, default=3, help="Run face detection every Nth frame with template tracking in between (default: 3)")
+    p_run.add_argument("--filter-face-presence", action="store_true", help="Filter vertical clips where teacher face is visible in < 70%% of frames")
 
     # Command: 'interactive'
     p_inter = subparsers.add_parser("interactive", help="Interactive clip and aspect ratio selection with boundary re-verification")
@@ -1118,6 +1122,7 @@ Examples:
     p_inter.add_argument("--legacy-render", action="store_true", help="Use legacy multi-step encoding (reframe encode -> caption encode) instead of single-pass render_reel")
     p_inter.add_argument("--fast", action="store_true", help="Use Apple Silicon hardware acceleration (h264_videotoolbox -b:v 12M) for final encode")
     p_inter.add_argument("--detect-every", type=int, default=3, help="Run face detection every Nth frame with template tracking in between (default: 3)")
+    p_inter.add_argument("--filter-face-presence", action="store_true", help="Filter vertical clips where teacher face is visible in < 70%% of frames")
 
     # Command: 'detect'
     p_detect = subparsers.add_parser("detect", help="Detect viral moments & hooks without rendering video")
@@ -1142,6 +1147,7 @@ Examples:
     p_detect.add_argument("--no-llm", action="store_true", help="Use local rule-based romanization only")
     p_detect.add_argument("--no-caption", action="store_true", help="Bypass caption burning")
     p_detect.add_argument("--whisper-backend", default="auto", choices=["auto", "openai", "mlx"], help="Whisper backend engine (default: auto, mlx if installed on Apple Silicon, else openai)")
+    p_detect.add_argument("--filter-face-presence", action="store_true", help="Filter vertical clips where teacher face is visible in < 70%% of frames")
 
     # Command: 'clip'
     p_clip = subparsers.add_parser("clip", help="Render a specific manual time window end-to-end")
