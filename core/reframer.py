@@ -25,6 +25,7 @@ import csv
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -347,6 +348,12 @@ class FaceReframer:
         else:
             self.layout = "direct-crop"
         self.aspect_ratio = getattr(config, "aspect_ratio", "9:16")
+        self.time_pass1: float = 0.0
+        self.time_render: float = 0.0
+        self.stage_timings: Dict[str, float] = {
+            "reframe pass 1": 0.0,
+            "reframe render": 0.0,
+        }
 
     def run(self) -> Path:
         """Execute reframing and write vertical / portrait output video."""
@@ -365,6 +372,7 @@ class FaceReframer:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        t_pass1_start = time.time()
 
         zoom = max(1.0, float(self.zoom))
 
@@ -690,6 +698,9 @@ class FaceReframer:
                 "-c:a", "aac", "-b:a", self.config.audio_bitrate, "-shortest",
                 "-movflags", "+faststart", str(out_path)
             ]
+        self.time_pass1 = time.time() - t_pass1_start
+        self.stage_timings["reframe pass 1"] = self.time_pass1
+        t_render_start = time.time()
         proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
 
         debug_writer: Optional[cv2.VideoWriter] = None
@@ -742,6 +753,8 @@ class FaceReframer:
             raise RuntimeError(f"FFmpeg process failed with return code {proc.returncode}")
 
         verify_av_sync(out_path, max_diff=0.05)
+        self.time_render = time.time() - t_render_start
+        self.stage_timings["reframe render"] = self.time_render
         print(f"[reframe] Success! Reframed video created at: {out_path}")
         return out_path
 

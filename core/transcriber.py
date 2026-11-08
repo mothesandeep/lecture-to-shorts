@@ -256,6 +256,12 @@ class HinglishTranscriber:
         self.no_llm = no_llm
         self.uppercase = uppercase
         self._last_call_time = 0.0
+        self.time_whisper: float = 0.0
+        self.time_romanize: float = 0.0
+        self.stage_timings: Dict[str, float] = {
+            "whisper": 0.0,
+            "gemini romanize": 0.0,
+        }
 
     def _call_gemini_batch(
         self,
@@ -438,6 +444,7 @@ class HinglishTranscriber:
         if not path_obj.is_file():
             raise FileNotFoundError(f"Video file not found: {path_obj}")
 
+        t_whisper_start = time.time()
         print(f"[transcribe] Loading Whisper model '{self.whisper_model_name}'...")
         wm = whisper.load_model(self.whisper_model_name)
 
@@ -472,9 +479,14 @@ class HinglishTranscriber:
 
         tokens = [w["word"] for w in raw_words]
         total_tokens = len(tokens)
+        self.time_whisper = time.time() - t_whisper_start
+        self.stage_timings["whisper"] = self.time_whisper
         print(f"[romanize] Transcribed {total_tokens} words. Processing Hinglish transliteration...")
 
+        t_gemini_start = time.time()
         llm_map = self.romanize_tokens(tokens, glossary=glossary, script_hint=script_hint)
+        self.time_romanize = time.time() - t_gemini_start
+        self.stage_timings["gemini romanize"] = self.time_romanize
 
         output_words: List[WordCaption] = []
         llm_count = 0

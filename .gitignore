@@ -18,6 +18,8 @@ env/
 # Media output and scratch artifacts
 output/*
 !output/.gitkeep
+samples/*
+!samples/.gitkeep
 *.mp4
 *.mov
 *.avi

@@ -224,8 +224,27 @@ class HookFinder:
                         "text": text
                     })
 
-            # Save to disk cache
-            cache_file.write_text(json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8")
+            # If prompt caused 0 segments (e.g. on lightweight models), retry once cleanly
+            if not segments:
+                res_retry = model.transcribe(
+                    str(tmp_audio_path),
+                    language="hi",
+                    condition_on_previous_text=False,
+                    fp16=False
+                )
+                for s in res_retry.get("segments", []):
+                    text = s.get("text", "").strip()
+                    if text:
+                        segments.append({
+                            "id": s.get("id", len(segments)),
+                            "start": round(float(s.get("start", 0.0)), 2),
+                            "end": round(float(s.get("end", 0.0)), 2),
+                            "text": text
+                        })
+
+            # Save to disk cache if segments found
+            if segments:
+                cache_file.write_text(json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"[hook_finder] Transcription completed ({len(segments)} segments) and cached -> {cache_file.name}")
             return segments
         finally:

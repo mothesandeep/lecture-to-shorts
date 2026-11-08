@@ -23,7 +23,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from core.boundary_refiner import refine_clip_boundaries
 from core.captioner import CaptionRenderer, list_styles
@@ -36,6 +36,60 @@ from core.hook_finder import (
 )
 from core.reframer import FaceReframer, ReframeConfig, reframe_video
 from core.transcriber import HinglishTranscriber
+
+
+def print_profile_table(stages: Dict[str, float], clip_title: str) -> None:
+    """Print an ASCII table of wall-clock time and percentage share per pipeline stage."""
+    total_time = sum(stages.values())
+    w_stage = max(max(len(k) for k in stages.keys()), 18)
+    print("\n" + "=" * 65)
+    print(f" PIPELINE STAGE TIMING PROFILE: {clip_title}")
+    print("=" * 65)
+    print(f"{'Stage':<{w_stage}} | {'Time (s)':>10} | {'Share (%)':>10}")
+    print("-" * (w_stage + 25))
+    for stage, elapsed in stages.items():
+        share = (elapsed / total_time * 100.0) if total_time > 0 else 0.0
+        print(f"{stage:<{w_stage}} | {elapsed:>9.2f}s | {share:>9.1f}%")
+    print("-" * (w_stage + 25))
+    print(f"{'Total Stage Time':<{w_stage}} | {total_time:>9.2f}s | {'100.0%':>10}")
+    print("=" * 65 + "\n")
+
+
+def save_profile_json(
+    output_dir: Path,
+    out_reel_path: Path,
+    clip_info: ViralClipMetadata,
+    stage_timings: Dict[str, float],
+    total_wall_time: float
+) -> Path:
+    """Write stage timings to output/profile_<clip>.json."""
+    total_stage_time = round(sum(stage_timings.values()), 3)
+    profile_data = {
+        "clip": out_reel_path.stem,
+        "clip_id": clip_info.clip_id,
+        "slug": clip_info.slug,
+        "title": clip_info.title,
+        "duration_s": clip_info.duration,
+        "output_file": str(out_reel_path),
+        "stages": stage_timings,
+        "total_stage_time_s": total_stage_time,
+        "total_wall_time_s": round(total_wall_time, 3),
+        **stage_timings,
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Primary profile json path: output/profile_<clip>.json
+    profile_json_path = output_dir / f"profile_{out_reel_path.stem}.json"
+    profile_json_path.write_text(json.dumps(profile_data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # Also ensure profile_<clip_id>_<slug>.json exists if stem differs
+    alt_name = f"profile_{clip_info.clip_id:02d}_{clip_info.slug}.json"
+    alt_path = output_dir / alt_name
+    if alt_path != profile_json_path:
+        alt_path.write_text(json.dumps(profile_data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    print(f"[profile] Wrote stage timings to: {profile_json_path}")
+    return profile_json_path
 
 
 def process_single_clip(
@@ -58,6 +112,7 @@ def process_single_clip(
     aspect: str = "auto",
     no_caption: bool = False,
     refine_boundaries: bool = False,
+    profile: bool = False,
 ) -> Path:
     """
     Process one viral clip end-to-end:
@@ -65,14 +120,25 @@ def process_single_clip(
     - If 9:16 / 4:5 / 1:1: Reframe -> Word Whisper -> Hinglish Romanize -> Burn Captions.
     - If 16:9: Preserve 16:9 Widescreen -> Subtitles / Clean export.
     """
+    t_clip_overall_start = time.time()
+    time_boundary_refine = 0.0
+    time_cut = 0.0
+    time_reframe_p1 = 0.0
+    time_reframe_render = 0.0
+    time_whisper = 0.0
+    time_romanize = 0.0
+    time_caption_burn = 0.0
+
     # 0. High-Precision Boundary Re-verification if requested
     if refine_boundaries:
+        t_br_start = time.time()
         refined_start, refined_end = refine_clip_boundaries(
             video_path=src_video,
             start_t=clip_info.start_time,
             end_t=clip_info.end_time,
             margin_s=60.0
         )
+        time_boundary_refine = time.time() - t_br_start
         clip_info.start_time = refined_start
         clip_info.end_time = refined_end
         clip_info.duration = round(refined_end - refined_start, 2)
@@ -140,12 +206,15 @@ def process_single_clip(
             clip_info.end_time,
             audio_delay_ms=audio_delay_ms
         )
-        print(f"[Clip {clip_info.clip_id}] Snippet cut in {time.time() - t0:.2f}s")
+        time_cut = time.time() - t0
+        print(f"[Clip {clip_info.clip_id}] Snippet cut in {time_cut:.2f}s")
 
         # Step B: Reframe or Preserve 16:9 Widescreen
         if is_widescreen:
             print(f"\n[Clip {clip_info.clip_id}] [2/4] Preserving native 16:9 widescreen format (bypassing FaceReframer)...")
             active_video_path = snippet_path
+            time_reframe_p1 = 0.0
+            time_reframe_render = 0.0
         else:
             reframe_label = "4:5 portrait" if is_4_5 else ("1:1 blur-bw" if layout == "blur-bw" else "9:16 vertical")
             print(f"\n[Clip {clip_info.clip_id}] [2/4] Face-tracking {reframe_label} reframing (layout={layout}, aspect={target_aspect})...")
@@ -161,12 +230,33 @@ def process_single_clip(
             reframer = FaceReframer(reframe_cfg)
             reframer.run()
             active_video_path = reframed_path
+            time_reframe_p1 = getattr(reframer, "time_pass1", 0.0)
+            time_reframe_render = getattr(reframer, "time_render", 0.0)
 
         # Step C & D: Handle optional captioning
         if no_caption:
             print(f"\n[Clip {clip_info.clip_id}] [3/4 & 4/4] Captions disabled (--no-caption). Saving clean video...")
             shutil.copy2(active_video_path, out_reel_path)
             print(f"\n>>> {'CLIP' if is_widescreen else 'REEL'} #{clip_info.clip_id} READY: {out_reel_path.name}")
+            if profile:
+                stage_timings: Dict[str, float] = {
+                    "cut": round(time_cut, 3),
+                    "boundary refine": round(time_boundary_refine, 3),
+                    "reframe pass 1": round(time_reframe_p1, 3),
+                    "reframe render": round(time_reframe_render, 3),
+                    "whisper": round(time_whisper, 3),
+                    "gemini romanize": round(time_romanize, 3),
+                    "caption burn": round(time_caption_burn, 3),
+                }
+                clip_title = f"Clip #{clip_info.clip_id:02d} ({clip_info.slug})"
+                print_profile_table(stage_timings, clip_title=clip_title)
+                save_profile_json(
+                    output_dir=output_dir,
+                    out_reel_path=out_reel_path,
+                    clip_info=clip_info,
+                    stage_timings=stage_timings,
+                    total_wall_time=time.time() - t_clip_overall_start
+                )
             return out_reel_path
 
         # Word-level Whisper transcription & Gemini Hinglish romanization
@@ -181,6 +271,8 @@ def process_single_clip(
         words = transcriber.transcribe_and_romanize(
             video_path=active_video_path
         )
+        time_whisper = getattr(transcriber, "time_whisper", 0.0)
+        time_romanize = getattr(transcriber, "time_romanize", 0.0)
 
         # Burn animated word captions via Pillow & FFmpeg
         print(f"\n[Clip {clip_info.clip_id}] [4/4] Burning animated captions to final video...")
@@ -202,13 +294,34 @@ def process_single_clip(
             bottom_offset=effective_bottom_offset,
             style=chosen_style
         )
+        t_burn_start = time.time()
         renderer.render_to_video(
             input_video=active_video_path,
             output_video=out_reel_path,
             words=words
         )
+        time_caption_burn = time.time() - t_burn_start
 
         print(f"\n>>> {'CLIP' if is_widescreen else 'REEL'} #{clip_info.clip_id} READY: {out_reel_path.name}")
+        if profile:
+            stage_timings = {
+                "cut": round(time_cut, 3),
+                "boundary refine": round(time_boundary_refine, 3),
+                "reframe pass 1": round(time_reframe_p1, 3),
+                "reframe render": round(time_reframe_render, 3),
+                "whisper": round(time_whisper, 3),
+                "gemini romanize": round(time_romanize, 3),
+                "caption burn": round(time_caption_burn, 3),
+            }
+            clip_title = f"Clip #{clip_info.clip_id:02d} ({clip_info.slug})"
+            print_profile_table(stage_timings, clip_title=clip_title)
+            save_profile_json(
+                output_dir=output_dir,
+                out_reel_path=out_reel_path,
+                clip_info=clip_info,
+                stage_timings=stage_timings,
+                total_wall_time=time.time() - t_clip_overall_start
+            )
         return out_reel_path
 
     finally:
@@ -288,7 +401,8 @@ def handle_run(args: argparse.Namespace) -> None:
             audio_delay_ms=args.audio_delay,
             aspect=args.aspect,
             no_caption=args.no_caption,
-            refine_boundaries=getattr(args, "refine_boundaries", False)
+            refine_boundaries=getattr(args, "refine_boundaries", False),
+            profile=getattr(args, "profile", False),
         )
         generated_reels.append(reel_file)
         meta_dict = clip.model_dump()
@@ -463,7 +577,8 @@ def handle_interactive(args: argparse.Namespace, existing_clips: Optional[List[V
             audio_delay_ms=getattr(args, "audio_delay", 500.0),
             aspect=chosen_aspect,
             no_caption=getattr(args, "no_caption", False),
-            refine_boundaries=True
+            refine_boundaries=True,
+            profile=getattr(args, "profile", False),
         )
         rendered_files.append(out_file)
 
@@ -530,7 +645,8 @@ def handle_clip(args: argparse.Namespace) -> None:
         audio_delay_ms=args.audio_delay,
         aspect=args.aspect,
         no_caption=args.no_caption,
-        refine_boundaries=getattr(args, "refine_boundaries", False)
+        refine_boundaries=getattr(args, "refine_boundaries", False),
+        profile=getattr(args, "profile", False),
     )
 
 
@@ -665,6 +781,7 @@ Examples:
     p_run.add_argument("--no-caption", action="store_true", help="Bypass caption burning and export clean trimmed/reframed video")
     p_run.add_argument("--caption", dest="no_caption", action="store_false", help="Force caption burning (default: enabled)")
     p_run.add_argument("--refine-boundaries", action="store_true", help="Run high-precision sentence boundary re-verification before rendering")
+    p_run.add_argument("--profile", action="store_true", help="Print per-stage wall-clock timing profile and save to output/profile_<clip>.json")
 
     # Command: 'interactive'
     p_inter = subparsers.add_parser("interactive", help="Interactive clip and aspect ratio selection with boundary re-verification")
@@ -686,6 +803,7 @@ Examples:
     p_inter.add_argument("--reframe-preset", default="talking_head", help="Reframing preset (default: talking_head)")
     p_inter.add_argument("--audio-delay", type=float, default=500.0, help="Audio delay offset in milliseconds to fix lip sync (default: 500.0)")
     p_inter.add_argument("--no-caption", action="store_true", help="Bypass caption burning and export clean trimmed/reframed video")
+    p_inter.add_argument("--profile", action="store_true", help="Print per-stage wall-clock timing profile and save to output/profile_<clip>.json")
 
     # Command: 'detect'
     p_detect = subparsers.add_parser("detect", help="Detect viral moments & hooks without rendering video")
@@ -734,6 +852,7 @@ Examples:
     p_clip.add_argument("--no-caption", action="store_true", help="Bypass caption burning and export clean trimmed/reframed video")
     p_clip.add_argument("--caption", dest="no_caption", action="store_false", help="Force caption burning (default: enabled)")
     p_clip.add_argument("--refine-boundaries", action="store_true", help="Run high-precision sentence boundary re-verification before rendering")
+    p_clip.add_argument("--profile", action="store_true", help="Print per-stage wall-clock timing profile and save to output/profile_<clip>.json")
 
     # Command: 'reframe'
     p_reframe = subparsers.add_parser("reframe", help="Standalone face-tracking 9:16 vertical crop")
