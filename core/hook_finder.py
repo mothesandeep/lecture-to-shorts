@@ -32,6 +32,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from core.whisper_backend import transcribe_words
+
 try:
     from core.av_sync import cut_snippet_accurate, ensure_cfr_video, probe_av_sync, verify_av_sync
 except ImportError:
@@ -158,13 +160,15 @@ class HookFinder:
         llm_model: Optional[str] = None,
         api_key: Optional[str] = None,
         min_duration: float = 28.0,
-        max_duration: float = 60.0
+        max_duration: float = 60.0,
+        backend: str = "auto"
     ) -> None:
         self.whisper_model_name = whisper_model
         self.llm_model_name = llm_model or os.getenv("HINGLISH_MODEL", "gemini-3.5-flash-lite")
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         self.min_duration = min_duration
         self.max_duration = max_duration
+        self.backend = backend
 
     def get_full_transcript(self, video_path: Path | str) -> List[Dict[str, Any]]:
         """
@@ -198,49 +202,32 @@ class HookFinder:
 
         try:
             extract_audio(v_path, tmp_audio_path)
-            print(f"[hook_finder] Loading Whisper model '{self.whisper_model_name}' for full-lecture scan...")
-            model = whisper.load_model(self.whisper_model_name)
-            print("[hook_finder] Transcribing full audio (this runs once and is cached)...")
+            print(f"[hook_finder] Transcribing full audio with Whisper model '{self.whisper_model_name}' (backend={self.backend})...")
             whisper_prompt = (
                 "यह एक हिंदी और हिंग्लिश क्लास लेक्चर वीडियो है जिसमें शिक्षक पढ़ा रहे हैं। "
                 "Ye ek Hindi Hinglish lecture video hai jisme teacher concepts aur motivation samjha rahe hain."
             )
-            res = model.transcribe(
-                str(tmp_audio_path),
+            trans_res = transcribe_words(
+                audio_path=tmp_audio_path,
                 language="hi",
+                model=self.whisper_model_name,
                 initial_prompt=whisper_prompt,
+                backend=self.backend,
+                word_timestamps=False,
                 condition_on_previous_text=False,
                 fp16=False
             )
 
-            segments: List[Dict[str, Any]] = []
-            for s in res.get("segments", []):
-                text = s.get("text", "").strip()
-                if text:
-                    segments.append({
-                        "id": s.get("id", len(segments)),
-                        "start": round(float(s.get("start", 0.0)), 2),
-                        "end": round(float(s.get("end", 0.0)), 2),
-                        "text": text
-                    })
-
-            # If prompt caused 0 segments (e.g. on lightweight models), retry once cleanly
-            if not segments:
-                res_retry = model.transcribe(
-                    str(tmp_audio_path),
-                    language="hi",
-                    condition_on_previous_text=False,
-                    fp16=False
-                )
-                for s in res_retry.get("segments", []):
-                    text = s.get("text", "").strip()
-                    if text:
-                        segments.append({
-                            "id": s.get("id", len(segments)),
-                            "start": round(float(s.get("start", 0.0)), 2),
-                            "end": round(float(s.get("end", 0.0)), 2),
-                            "text": text
-                        })
+            segments: List[Dict[str, Any]] = [
+                {
+                    "id": s.get("id", i),
+                    "start": round(float(s.get("start", 0.0)), 2),
+                    "end": round(float(s.get("end", 0.0)), 2),
+                    "text": s.get("text", "").strip()
+                }
+                for i, s in enumerate(trans_res.segments)
+                if s.get("text", "").strip()
+            ]
 
             # Save to disk cache if segments found
             if segments:

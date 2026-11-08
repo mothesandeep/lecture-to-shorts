@@ -143,9 +143,11 @@ def run_diagnostics(model_name: str = "gemini-3.5-flash-lite") -> bool:
         import torch
         import whisper
         from core.transcriber import DEFAULT_WHISPER_INITIAL_PROMPT
+        from core.whisper_backend import HAS_MLX_WHISPER
         mps_avail = torch.backends.mps.is_available()
         print(f"  • PyTorch Version: {torch.__version__} (Apple Silicon MPS: {mps_avail})")
-        print(f"  • OpenAI Whisper : Installed & Ready")
+        print(f"  • OpenAI Whisper : Installed & Ready (CPU FP32)")
+        print(f"  • MLX Whisper    : {'Installed & Ready (Apple Silicon GPU)' if HAS_MLX_WHISPER else 'Not available'}")
         print(f"  • Default Model  : large-v3 (Word-level clip sync)")
         print(f"  • Decoding Config: no_speech_thr=0.3, condition_on_previous_text=False")
         print(f"  • Initial Prompt : \"{DEFAULT_WHISPER_INITIAL_PROMPT[:45]}...\" [OK]")

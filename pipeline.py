@@ -113,6 +113,7 @@ def process_single_clip(
     no_caption: bool = False,
     refine_boundaries: bool = False,
     profile: bool = False,
+    whisper_backend: str = "auto",
 ) -> Path:
     """
     Process one viral clip end-to-end:
@@ -136,7 +137,8 @@ def process_single_clip(
             video_path=src_video,
             start_t=clip_info.start_time,
             end_t=clip_info.end_time,
-            margin_s=60.0
+            margin_s=60.0,
+            backend=whisper_backend,
         )
         time_boundary_refine = time.time() - t_br_start
         clip_info.start_time = refined_start
@@ -266,7 +268,8 @@ def process_single_clip(
             llm_model=llm_model,
             api_key=api_key,
             no_llm=no_llm,
-            uppercase=True
+            uppercase=True,
+            backend=whisper_backend,
         )
         words = transcriber.transcribe_and_romanize(
             video_path=active_video_path
@@ -345,6 +348,7 @@ def handle_run(args: argparse.Namespace) -> None:
     print(f"• Target Clips    : {args.clips} clips")
     print(f"• Target Aspect   : {args.aspect} (<180s -> 9:16 vertical, >=180s -> 16:9 widescreen)")
     print(f"• Captions        : {'Disabled (--no-caption)' if args.no_caption else f'Enabled ({args.style})'}")
+    print(f"• Whisper Backend : {getattr(args, 'whisper_backend', 'auto')}")
     print(f"• Full Scan Model : Whisper '{args.whisper_full_model}' (Cached)")
     print(f"• Word Sync Model : Whisper '{args.whisper_clip_model}'")
     print(f"• AI Brain        : {args.llm_model}")
@@ -362,7 +366,8 @@ def handle_run(args: argparse.Namespace) -> None:
         llm_model=args.llm_model,
         api_key=args.api_key,
         min_duration=args.min_duration,
-        max_duration=args.max_duration
+        max_duration=args.max_duration,
+        backend=getattr(args, "whisper_backend", "auto"),
     )
     clips = finder.find_viral_clips(input_path, num_clips=args.clips)
 
@@ -403,6 +408,7 @@ def handle_run(args: argparse.Namespace) -> None:
             no_caption=args.no_caption,
             refine_boundaries=getattr(args, "refine_boundaries", False),
             profile=getattr(args, "profile", False),
+            whisper_backend=getattr(args, "whisper_backend", "auto"),
         )
         generated_reels.append(reel_file)
         meta_dict = clip.model_dump()
@@ -437,7 +443,8 @@ def handle_detect(args: argparse.Namespace) -> None:
         llm_model=args.llm_model,
         api_key=args.api_key,
         min_duration=args.min_duration,
-        max_duration=args.max_duration
+        max_duration=args.max_duration,
+        backend=getattr(args, "whisper_backend", "auto"),
     )
     clips = finder.find_viral_clips(input_path, num_clips=args.clips)
 
@@ -477,7 +484,8 @@ def handle_interactive(args: argparse.Namespace, existing_clips: Optional[List[V
             llm_model=getattr(args, "llm_model", None),
             api_key=getattr(args, "api_key", None),
             min_duration=getattr(args, "min_duration", 28.0),
-            max_duration=getattr(args, "max_duration", 60.0)
+            max_duration=getattr(args, "max_duration", 60.0),
+            backend=getattr(args, "whisper_backend", "auto"),
         )
         clips = finder.find_viral_clips(input_path, num_clips=getattr(args, "clips", 3))
 
@@ -579,6 +587,7 @@ def handle_interactive(args: argparse.Namespace, existing_clips: Optional[List[V
             no_caption=getattr(args, "no_caption", False),
             refine_boundaries=True,
             profile=getattr(args, "profile", False),
+            whisper_backend=getattr(args, "whisper_backend", "auto"),
         )
         rendered_files.append(out_file)
 
@@ -647,6 +656,7 @@ def handle_clip(args: argparse.Namespace) -> None:
         no_caption=args.no_caption,
         refine_boundaries=getattr(args, "refine_boundaries", False),
         profile=getattr(args, "profile", False),
+        whisper_backend=getattr(args, "whisper_backend", "auto"),
     )
 
 
@@ -706,7 +716,8 @@ def handle_caption(args: argparse.Namespace) -> None:
         api_key=args.api_key,
         rpm=args.rpm,
         no_llm=args.no_llm,
-        uppercase=not args.no_upper
+        uppercase=not args.no_upper,
+        backend=getattr(args, "whisper_backend", "auto"),
     )
     words = transcriber.transcribe_and_romanize(
         video_path=src_path,
@@ -782,6 +793,7 @@ Examples:
     p_run.add_argument("--caption", dest="no_caption", action="store_false", help="Force caption burning (default: enabled)")
     p_run.add_argument("--refine-boundaries", action="store_true", help="Run high-precision sentence boundary re-verification before rendering")
     p_run.add_argument("--profile", action="store_true", help="Print per-stage wall-clock timing profile and save to output/profile_<clip>.json")
+    p_run.add_argument("--whisper-backend", default="auto", choices=["auto", "openai", "mlx"], help="Whisper backend engine (default: auto, mlx if installed on Apple Silicon, else openai)")
 
     # Command: 'interactive'
     p_inter = subparsers.add_parser("interactive", help="Interactive clip and aspect ratio selection with boundary re-verification")
@@ -804,6 +816,7 @@ Examples:
     p_inter.add_argument("--audio-delay", type=float, default=500.0, help="Audio delay offset in milliseconds to fix lip sync (default: 500.0)")
     p_inter.add_argument("--no-caption", action="store_true", help="Bypass caption burning and export clean trimmed/reframed video")
     p_inter.add_argument("--profile", action="store_true", help="Print per-stage wall-clock timing profile and save to output/profile_<clip>.json")
+    p_inter.add_argument("--whisper-backend", default="auto", choices=["auto", "openai", "mlx"], help="Whisper backend engine (default: auto, mlx if installed on Apple Silicon, else openai)")
 
     # Command: 'detect'
     p_detect = subparsers.add_parser("detect", help="Detect viral moments & hooks without rendering video")
@@ -827,6 +840,7 @@ Examples:
     p_detect.add_argument("--save-intermediate", action="store_true", help="Keep cut snippets and reframed videos")
     p_detect.add_argument("--no-llm", action="store_true", help="Use local rule-based romanization only")
     p_detect.add_argument("--no-caption", action="store_true", help="Bypass caption burning")
+    p_detect.add_argument("--whisper-backend", default="auto", choices=["auto", "openai", "mlx"], help="Whisper backend engine (default: auto, mlx if installed on Apple Silicon, else openai)")
 
     # Command: 'clip'
     p_clip = subparsers.add_parser("clip", help="Render a specific manual time window end-to-end")
@@ -853,6 +867,7 @@ Examples:
     p_clip.add_argument("--caption", dest="no_caption", action="store_false", help="Force caption burning (default: enabled)")
     p_clip.add_argument("--refine-boundaries", action="store_true", help="Run high-precision sentence boundary re-verification before rendering")
     p_clip.add_argument("--profile", action="store_true", help="Print per-stage wall-clock timing profile and save to output/profile_<clip>.json")
+    p_clip.add_argument("--whisper-backend", default="auto", choices=["auto", "openai", "mlx"], help="Whisper backend engine (default: auto, mlx if installed on Apple Silicon, else openai)")
 
     # Command: 'reframe'
     p_reframe = subparsers.add_parser("reframe", help="Standalone face-tracking 9:16 vertical crop")
@@ -890,6 +905,7 @@ Examples:
     p_caption.add_argument("--no-llm", action="store_true", help="Use local rule-based romanizer only")
     p_caption.add_argument("--no-upper", action="store_true", help="Keep text lowercase")
     p_caption.add_argument("--preview", action="store_true", help="Transcribe & print preview only without rendering")
+    p_caption.add_argument("--whisper-backend", default="auto", choices=["auto", "openai", "mlx"], help="Whisper backend engine (default: auto, mlx if installed on Apple Silicon, else openai)")
 
     # Command: 'test'
     p_test = subparsers.add_parser("test", help="Run system diagnostics and health check")

@@ -42,6 +42,13 @@ from core.transcriber import (
     local_romanize,
     sanitize_latin,
 )
+from core.whisper_backend import (
+    HAS_MLX_WHISPER,
+    TranscriptionResult,
+    Word,
+    get_whisper_model,
+    transcribe_words,
+)
 
 __all__ = [
     "CAPTION_STYLES",
@@ -74,5 +81,10 @@ __all__ = [
     "WordCaption",
     "local_romanize",
     "sanitize_latin",
+    "Word",
+    "TranscriptionResult",
+    "transcribe_words",
+    "get_whisper_model",
+    "HAS_MLX_WHISPER",
 ]
 

@@ -43,7 +43,8 @@ def refine_clip_boundaries(
     start_t: float,
     end_t: float,
     margin_s: float = 60.0,
-    whisper_model: str = "base"
+    whisper_model: str = "base",
+    backend: str = "auto"
 ) -> Tuple[float, float]:
     """
     Refine rough clip start and end timestamps using a +/- margin_s audio window:
@@ -93,12 +94,12 @@ def refine_clip_boundaries(
             return start_t, end_t
 
         # 2. Fast Whisper word-level pass on the 2-3 minute audio chunk
-        import whisper
-        wm = whisper.load_model(whisper_model)
-        transcribe_res = wm.transcribe(
-            str(tmp_audio),
+        from core.whisper_backend import transcribe_words
+        trans_res = transcribe_words(
+            audio_path=tmp_audio,
             language="hi",
-            task="transcribe",
+            model=whisper_model,
+            backend=backend,
             word_timestamps=True,
             condition_on_previous_text=False,
             no_speech_threshold=0.3,
@@ -106,20 +107,15 @@ def refine_clip_boundaries(
         )
 
         # 3. Collect word timestamps shifted to global video timeline
-        words: List[Dict[str, Any]] = []
+        words: List[Dict[str, Any]] = [
+            {
+                "word": w.text,
+                "start": window_start + w.start,
+                "end": window_start + w.end
+            }
+            for w in trans_res.words
+        ]
         terminal_puncts = {".", "!", "?", "।", "॥"}
-
-        for segment in transcribe_res.get("segments", []):
-            for w in segment.get("words", []):
-                cleaned = w.get("word", "").strip()
-                if cleaned:
-                    w_start = window_start + float(w.get("start", 0.0))
-                    w_end = window_start + float(w.get("end", 0.0))
-                    words.append({
-                        "word": cleaned,
-                        "start": w_start,
-                        "end": w_end
-                    })
 
         if not words:
             print("[boundary] No speech detected in boundary window -> retaining original timestamps.")

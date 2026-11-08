@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from core.whisper_backend import transcribe_words
+
 # ----------------- Strict Latin & Alphabet Constants -----------------
 DEV = re.compile(r"[\u0900-\u097F]")
 PUNCT = " .,?!।॥\"'“”‘’-–—…:;()[]{}"
@@ -246,7 +248,8 @@ class HinglishTranscriber:
         rpm: float = 8.0,
         batch_size: int = 50,
         no_llm: bool = False,
-        uppercase: bool = True
+        uppercase: bool = True,
+        backend: str = "auto"
     ) -> None:
         self.whisper_model_name = whisper_model
         self.llm_model_name = llm_model or os.getenv("HINGLISH_MODEL", "gemini-3.5-flash-lite")
@@ -255,6 +258,7 @@ class HinglishTranscriber:
         self.batch_size = batch_size
         self.no_llm = no_llm
         self.uppercase = uppercase
+        self.backend = backend
         self._last_call_time = 0.0
         self.time_whisper: float = 0.0
         self.time_romanize: float = 0.0
@@ -438,45 +442,32 @@ class HinglishTranscriber:
         then romanize Devanagari tokens to Hinglish.
         Guarantees 100% Latin ASCII words.
         """
-        import whisper
-
         path_obj = Path(video_path).expanduser().resolve()
         if not path_obj.is_file():
             raise FileNotFoundError(f"Video file not found: {path_obj}")
-
-        t_whisper_start = time.time()
-        print(f"[transcribe] Loading Whisper model '{self.whisper_model_name}'...")
-        wm = whisper.load_model(self.whisper_model_name)
 
         prompt = whisper_prompt.strip() if whisper_prompt else DEFAULT_WHISPER_INITIAL_PROMPT
         if glossary and glossary.strip():
             prompt = f"{prompt} Key terms: {glossary.strip()}"
 
-        transcribe_kwargs: Dict[str, Any] = {
-            "language": "hi",
-            "task": "transcribe",
-            "word_timestamps": True,
-            "condition_on_previous_text": False,
-            "no_speech_threshold": 0.3,
-            "initial_prompt": prompt,
-            "fp16": False  # Stability invariant on Apple Silicon
-        }
+        t_whisper_start = time.time()
+        print(f"[transcribe] Transcribing audio with word-level timestamps from: {path_obj.name} (model={self.whisper_model_name}, backend={self.backend})...")
+        trans_res = transcribe_words(
+            audio_path=path_obj,
+            language="hi",
+            model=self.whisper_model_name,
+            initial_prompt=prompt,
+            backend=self.backend,
+            word_timestamps=True,
+            condition_on_previous_text=False,
+            no_speech_threshold=0.3,
+            fp16=False
+        )
 
-        print(f"[transcribe] Transcribing audio with word-level timestamps from: {path_obj.name} (no_speech_thr=0.3, prompt_len={len(prompt)})...")
-        whisper_result = wm.transcribe(str(path_obj), **transcribe_kwargs)
-
-        # Extract words from segments without timestamp drift
-        raw_words: List[Dict[str, Any]] = []
-        for segment in whisper_result.get("segments", []):
-            for word_info in segment.get("words", []):
-                cleaned_word = word_info.get("word", "").strip()
-                if cleaned_word:
-                    raw_words.append({
-                        "word": cleaned_word,
-                        "start": float(word_info.get("start", 0.0)),
-                        "end": float(word_info.get("end", 0.0))
-                    })
-
+        raw_words: List[Dict[str, Any]] = [
+            {"word": w.text, "start": w.start, "end": w.end}
+            for w in trans_res.words
+        ]
         tokens = [w["word"] for w in raw_words]
         total_tokens = len(tokens)
         self.time_whisper = time.time() - t_whisper_start
